@@ -35,12 +35,12 @@ simd = ["datafusion/simd"]
 [dependencies]
 ahash = { version = "0.7", default-features = false }
 
-arrow-flight = { version = "18.0.0" }
+arrow-flight = { git = "https://github.com/avantgardnerio/arrow-rs.git", branch = "bg_auth" }
 async-trait = "0.1.41"
 chrono = { version = "0.4", default-features = false }
 clap = { version = "3", features = ["derive", "cargo"] }
-datafusion = { git = "https://github.com/apache/arrow-datafusion", rev = "6a5de4fe08597896ab6375e3e4b76c5744dcfba7" }
-datafusion-proto = { git = "https://github.com/apache/arrow-datafusion", rev = "6a5de4fe08597896ab6375e3e4b76c5744dcfba7" }
+datafusion = { git = "https://github.com/spaceandtimelabs/arrow-datafusion.git", branch = "bg_auth" }
+datafusion-proto = { git = "https://github.com/spaceandtimelabs/arrow-datafusion.git", branch = "bg_auth" }
 futures = "0.3"
 hashbrown = "0.12"
 
