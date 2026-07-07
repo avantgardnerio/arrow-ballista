@@ -18,6 +18,7 @@ use crate::physical_optimizer::filter_pushdown::FilterPushdown;
 use crate::state::aqe::adapter::BallistaAdapter;
 use crate::state::aqe::execution_plan::{AdaptiveDatafusionExec, ExchangeExec};
 use crate::state::aqe::optimizer_rule::chaos_exec::ChaosCreatingRule;
+use crate::state::aqe::optimizer_rule::parallel_window_detect::ParallelWindowDetectRule;
 use crate::state::aqe::optimizer_rule::{
     CoalescePartitionsRule, DelayJoinSelectionRule, DistributedExchangeRule,
     PropagateEmptyExecRule, SelectJoinRule,
@@ -501,6 +502,11 @@ impl AdaptivePlanner {
 
         // changing plan before other built in optimizers kick in
         physical_optimizers.push(Arc::new(PropagateEmptyExecRule::default()));
+
+        // detection-only: log parallelizable RANGE-frame windows. Runs before
+        // the datafusion optimizers so we see the plan shape as produced by
+        // the planner, not after EnsureRequirements has bolted on SPMs.
+        physical_optimizers.push(Arc::new(ParallelWindowDetectRule));
 
         // select actual join implementation based on current runtime information
         physical_optimizers

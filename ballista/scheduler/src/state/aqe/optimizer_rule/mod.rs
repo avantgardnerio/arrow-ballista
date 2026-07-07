@@ -19,6 +19,7 @@ pub mod chaos_exec;
 pub mod coalesce_partitions;
 pub mod distributed_exchange;
 pub mod join_selection;
+pub mod parallel_window_detect;
 pub mod propagate_empty;
 
 pub use coalesce_partitions::*;
