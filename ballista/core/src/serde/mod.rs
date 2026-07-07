@@ -54,8 +54,8 @@ use std::{convert::TryInto, io::Cursor};
 
 use crate::execution_plans::sort_shuffle::SortShuffleConfig;
 use crate::execution_plans::{
-    ChaosExec, CoalescePlan, PartitionGroup, ShuffleReaderExec, ShuffleWriterExec,
-    SortShuffleWriterExec, UnresolvedShuffleExec,
+    ChaosExec, CoalescePlan, DynamicRangeRepartitionExec, PartitionGroup,
+    ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec, UnresolvedShuffleExec,
 };
 use crate::serde::protobuf::{
     ballista_logical_plan_node::LogicalPlanType,
@@ -547,6 +547,17 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     Some(chaos_exec.seed),
                 )?))
             }
+            PhysicalPlanType::DynamicRangeRepartition(_) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "DynamicRangeRepartitionExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                Ok(Arc::new(DynamicRangeRepartitionExec::try_new(
+                    input.clone(),
+                )?))
+            }
         }
     }
 
@@ -719,6 +730,18 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
             proto.encode(buf).map_err(|e| {
                 DataFusionError::Internal(format!(
                     "failed to encode chaos monkey execution plan: {e:?}"
+                ))
+            })?;
+            Ok(())
+        } else if node.downcast_ref::<DynamicRangeRepartitionExec>().is_some() {
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::DynamicRangeRepartition(
+                    protobuf::DynamicRangeRepartitionExecNode {},
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode DynamicRangeRepartitionExec: {e:?}"
                 ))
             })?;
             Ok(())

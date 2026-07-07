@@ -51,7 +51,14 @@ message BallistaPhysicalPlanNode {
     UnresolvedShuffleExecNode unresolved_shuffle = 3;
     SortShuffleWriterExecNode sort_shuffle_writer = 4;
     ChaosExecNode chaos_exec = 5;
+    DynamicRangeRepartitionExecNode dynamic_range_repartition = 6;
   }
+}
+
+// Passthrough marker for parallel-window range partitioning. The child
+// plan is plumbed by the framework as `inputs[0]` during decode, so this
+// message carries no fields.
+message DynamicRangeRepartitionExecNode {
 }
 
 message ChaosExecNode {

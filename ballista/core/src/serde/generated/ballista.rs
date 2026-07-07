@@ -31,7 +31,7 @@ pub struct LogicalPlanCacheNode {
 pub struct BallistaPhysicalPlanNode {
     #[prost(
         oneof = "ballista_physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 5"
+        tags = "1, 2, 3, 4, 5, 6"
     )]
     pub physical_plan_type: ::core::option::Option<
         ballista_physical_plan_node::PhysicalPlanType,
@@ -51,8 +51,15 @@ pub mod ballista_physical_plan_node {
         SortShuffleWriter(super::SortShuffleWriterExecNode),
         #[prost(message, tag = "5")]
         ChaosExec(super::ChaosExecNode),
+        #[prost(message, tag = "6")]
+        DynamicRangeRepartition(super::DynamicRangeRepartitionExecNode),
     }
 }
+/// Passthrough marker for parallel-window range partitioning. The child
+/// plan is plumbed by the framework as `inputs\[0\]` during decode, so this
+/// message carries no fields.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DynamicRangeRepartitionExecNode {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChaosExecNode {
     #[prost(double, tag = "1")]

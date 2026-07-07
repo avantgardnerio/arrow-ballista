@@ -15,15 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Detection-only rule: log when the plan contains a bounded RANGE-frame
-//! window that could be parallelized by inserting a `RangeRepartitionExec`
-//! above the window's input.
+//! Rule that wraps every parallelizable window's input in a
+//! `DynamicRangeRepartitionExec` marker. The marker is a pass-through today;
+//! upcoming commits grow it into a T-Digest sampler + value-range router.
 //!
-//! No plan mutation happens here — the rule returns the input plan
-//! unchanged. The pitch is completion-under-memory-pressure via range
-//! partitioning, so the detection logs are a scaffold for later wiring;
-//! they answer *does this query shape reach us?* before we spend effort on
-//! the `RangeRepartitionExec` port.
+//! The pitch is completion-under-memory-pressure via range partitioning.
+//! Shipping the pass-through first proves the wrapper lands in the right plan
+//! slot before touching execution semantics.
 //!
 //! # TODO — widen detection as the rewrite lands
 //!   - **Multi-column `ORDER BY`.** Today we require a single sort key so
@@ -37,14 +35,14 @@
 //!     `avg(...) OVER (ORDER BY id3 ROWS BETWEEN 100 PRECEDING AND
 //!     CURRENT ROW)`), but the halo unit is rows not order-key deltas so
 //!     the coordinator is a different calculation.
-//!   - **Bound scalar types we can't natively bucket.** Detection accepts
-//!     any non-null scalar today, but the eventual rewrite will need KLL
-//!     sketches (or similar streaming quantile estimators) to compute
-//!     range boundaries when the order key isn't natively rangeable at
-//!     plan time.
+//!   - **Non-Float64 routing keys.** Currently gated to `Float64` because
+//!     DataFusion's built-in T-Digest is `f64`-only. Widening waits on a
+//!     DIY generic-over-`Ord` KLL sketch we intend to build later.
 
+use ballista_core::execution_plans::DynamicRangeRepartitionExec;
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::config::ConfigOptions;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{WindowFrameBound, WindowFrameUnits};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
@@ -53,8 +51,11 @@ use datafusion::physical_plan::windows::BoundedWindowAggExec;
 use log::info;
 use std::sync::Arc;
 
-/// Physical optimizer pass that logs every parallelizable window it sees
-/// and returns the plan unchanged.
+/// Physical optimizer pass that wraps every parallelizable window's input
+/// in a `DynamicRangeRepartitionExec` marker. That operator is a pass-through
+/// today; upcoming commits grow it into a T-Digest sampler + value-range
+/// router. Inserting the pass-through first lets us prove the rewrite lands
+/// in the right plan slot before touching execution semantics.
 #[derive(Default, Debug)]
 pub struct ParallelWindowDetectRule;
 
@@ -64,15 +65,33 @@ impl PhysicalOptimizerRule for ParallelWindowDetectRule {
         plan: Arc<dyn ExecutionPlan>,
         _config: &ConfigOptions,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        for shape in detect_candidates(&plan)? {
+        let out = plan.transform_down(|node| {
+            let Some(bwag) = as_candidate(node.as_ref()) else {
+                return Ok(Transformed::no(node));
+            };
             info!(
-                "ParallelWindow: candidate detected — order-by=`{}`, frame=RANGE BETWEEN {} AND {}",
-                shape.order_key,
-                fmt_bound(&shape.start_bound),
-                fmt_bound(&shape.end_bound),
+                "ParallelWindow: wrapping BWAG input — order-by=`{}`, frame=RANGE BETWEEN {} AND {}",
+                bwag.order_key,
+                fmt_bound(&bwag.start_bound),
+                fmt_bound(&bwag.end_bound),
             );
-        }
-        Ok(plan)
+            let children = node.children();
+            let [bwag_input] = children.as_slice() else {
+                return datafusion::common::internal_err!(
+                    "BoundedWindowAggExec must have exactly one child, got {}",
+                    children.len()
+                );
+            };
+            let wrapped: Arc<dyn ExecutionPlan> = Arc::new(
+                DynamicRangeRepartitionExec::try_new((*bwag_input).clone())?,
+            );
+            let new_bwag = node.with_new_children(vec![wrapped])?;
+            // Jump past the rewritten node's children — the BWAG we just
+            // reconstructed still matches `as_candidate` by shape, and
+            // recursing would re-wrap forever.
+            Ok(Transformed::new(new_bwag, true, TreeNodeRecursion::Jump))
+        })?;
+        Ok(out.data)
     }
 
     fn name(&self) -> &str {
@@ -84,45 +103,43 @@ impl PhysicalOptimizerRule for ParallelWindowDetectRule {
     }
 }
 
-/// Shape captured from a matching `BoundedWindowAggExec`. Everything the
-/// rewrite will eventually need to plant a `RangeRepartitionExec` is here.
+/// Fields extracted from a matching `BoundedWindowAggExec` — everything the
+/// rewrite will eventually need to plant a `DynamicRangeRepartitionExec`.
 #[derive(Debug, Clone, PartialEq)]
-pub struct WindowCandidate {
-    pub order_key: String,
-    pub start_bound: WindowFrameBound,
-    pub end_bound: WindowFrameBound,
+struct BwagCandidate {
+    order_key: String,
+    start_bound: WindowFrameBound,
+    end_bound: WindowFrameBound,
 }
 
-/// Walk `plan` and return one entry per `BoundedWindowAggExec` that matches
-/// the parallel-window shape.
-pub fn detect_candidates(
-    plan: &Arc<dyn ExecutionPlan>,
-) -> datafusion::common::Result<Vec<WindowCandidate>> {
-    let mut hits = Vec::new();
-    plan.apply(|node| {
-        if let Some(shape) = as_candidate(node.as_ref()) {
-            hits.push(shape);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    })?;
-    Ok(hits)
-}
-
-fn as_candidate(node: &dyn ExecutionPlan) -> Option<WindowCandidate> {
-    let window = node.downcast_ref::<BoundedWindowAggExec>()?;
+fn as_candidate(node: &dyn ExecutionPlan) -> Option<BwagCandidate> {
+    let bwag = node.downcast_ref::<BoundedWindowAggExec>()?;
+    // AQE re-runs the optimizer chain on every stage-boundary replan. If we
+    // already wrapped this BWAG's subtree in an earlier pass, skip — otherwise
+    // we nest another marker per replan and the plan grows one layer per
+    // iteration, driving AQE into a livelock instead of converging.
+    if subtree_has_marker(bwag.input().as_ref()) {
+        return None;
+    }
     // Shape gates as slice patterns: 0 or 2+ elements simply don't match.
     // No cross-line invariants for the reader to hold in their head.
-    let [expr] = window.window_expr() else {
+    let [window_expr] = bwag.window_expr() else {
         return None;
     };
-    let [] = expr.partition_by() else {
+    let [] = window_expr.partition_by() else {
         return None;
     };
-    let [order] = expr.order_by() else {
+    let [order_by_expr] = window_expr.order_by() else {
         return None;
     };
-    let column = order.expr.downcast_ref::<Column>()?;
-    let frame = expr.get_window_frame();
+    let order_column = order_by_expr.expr.downcast_ref::<Column>()?;
+    // Rewrite only applies when the routing key is Float64 — that's what DF's
+    // T-Digest speaks. Other scalar types wait for the DIY generic-KLL follow-up.
+    let input_schema = bwag.input().schema();
+    let DataType::Float64 = input_schema.field(order_column.index()).data_type() else {
+        return None;
+    };
+    let frame = window_expr.get_window_frame();
     let WindowFrameUnits::Range = frame.units else {
         return None;
     };
@@ -131,11 +148,23 @@ fn as_candidate(node: &dyn ExecutionPlan) -> Option<WindowCandidate> {
     else {
         return None;
     };
-    Some(WindowCandidate {
-        order_key: column.name().to_string(),
+    Some(BwagCandidate {
+        order_key: order_column.name().to_string(),
         start_bound: start.clone(),
         end_bound: end.clone(),
     })
+}
+
+/// True when `plan` or any of its descendants is a
+/// `DynamicRangeRepartitionExec`. Cheap in-process walk; the plan tree is
+/// small compared to the data volume it describes.
+fn subtree_has_marker(plan: &dyn ExecutionPlan) -> bool {
+    if plan.downcast_ref::<DynamicRangeRepartitionExec>().is_some() {
+        return true;
+    }
+    plan.children()
+        .iter()
+        .any(|child| subtree_has_marker(child.as_ref()))
 }
 
 /// Returns the bound unchanged when it's `CurrentRow` or a non-null scalar
@@ -164,6 +193,7 @@ fn fmt_bound(bound: &WindowFrameBound) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ballista_core::execution_plans::DynamicRangeRepartitionExec;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::prelude::SessionContext;
@@ -181,50 +211,60 @@ mod tests {
         ctx.sql(sql).await?.create_physical_plan().await
     }
 
+    /// Runs the rule on `sql` and returns the number of
+    /// `DynamicRangeRepartitionExec` nodes it inserted. `1` means the target
+    /// shape matched and got wrapped; `0` means the rule left the plan alone.
+    async fn count_wraps(sql: &str) -> datafusion::common::Result<usize> {
+        let plan = plan(sql).await?;
+        let rewritten = ParallelWindowDetectRule.optimize(plan, &ConfigOptions::new())?;
+        let mut wraps = 0;
+        rewritten.apply(|node| {
+            if node.downcast_ref::<DynamicRangeRepartitionExec>().is_some() {
+                wraps += 1;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(wraps)
+    }
+
     // Q8 shape — RANGE frame on a double order key with an Int64 bound.
-    // The old Int64-only detection rejected this; this rule must accept.
+    // The old Int64-only detection rejected this; this rule must wrap.
     #[tokio::test]
-    async fn detects_range_frame_double_orderby_int_bound()
-    -> datafusion::common::Result<()> {
-        let plan = plan(
+    async fn wraps_range_frame_double_orderby_int_bound() -> datafusion::common::Result<()>
+    {
+        let wraps = count_wraps(
             "SELECT sum(v2) OVER (ORDER BY v2 \
                 RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) \
              FROM large",
         )
         .await?;
-        let candidates = detect_candidates(&plan)?;
-        assert_eq!(
-            candidates.len(),
-            1,
-            "expected one candidate, got {candidates:?}"
-        );
-        assert_eq!(candidates[0].order_key, "v2");
+        assert_eq!(wraps, 1);
         Ok(())
     }
 
     // ROWS frames are out of scope for this pass.
     #[tokio::test]
     async fn rejects_rows_frame() -> datafusion::common::Result<()> {
-        let plan = plan(
+        let wraps = count_wraps(
             "SELECT avg(v2) OVER (ORDER BY id3 \
                 ROWS BETWEEN 100 PRECEDING AND CURRENT ROW) \
              FROM large",
         )
         .await?;
-        assert!(detect_candidates(&plan)?.is_empty());
+        assert_eq!(wraps, 0);
         Ok(())
     }
 
     // PARTITION BY takes the query off the single-partition parallel path.
     #[tokio::test]
     async fn rejects_partition_by() -> datafusion::common::Result<()> {
-        let plan = plan(
+        let wraps = count_wraps(
             "SELECT sum(v2) OVER (PARTITION BY id1 ORDER BY v2 \
                 RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) \
              FROM large",
         )
         .await?;
-        assert!(detect_candidates(&plan)?.is_empty());
+        assert_eq!(wraps, 0);
         Ok(())
     }
 
@@ -232,21 +272,112 @@ mod tests {
     // CarryExec / prefix-scan path, not the RangeRepartition path.
     #[tokio::test]
     async fn rejects_unbounded_preceding() -> datafusion::common::Result<()> {
-        let plan = plan(
+        let wraps = count_wraps(
             "SELECT sum(v2) OVER (ORDER BY v2 \
                 RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
              FROM large",
         )
         .await?;
-        assert!(detect_candidates(&plan)?.is_empty());
+        assert_eq!(wraps, 0);
         Ok(())
     }
 
     // No ORDER BY → no range partitioning to do.
     #[tokio::test]
     async fn rejects_no_order_by() -> datafusion::common::Result<()> {
-        let plan = plan("SELECT sum(v2) OVER () FROM large").await?;
-        assert!(detect_candidates(&plan)?.is_empty());
+        let wraps = count_wraps("SELECT sum(v2) OVER () FROM large").await?;
+        assert_eq!(wraps, 0);
+        Ok(())
+    }
+
+    // Rewrite only applies to Float64 routing keys (T-Digest limitation).
+    // id3 is Int64 in the test schema, so this must not match even though
+    // the frame + shape are otherwise valid.
+    #[tokio::test]
+    async fn rejects_non_float64_order_by() -> datafusion::common::Result<()> {
+        let wraps = count_wraps(
+            "SELECT sum(v2) OVER (ORDER BY id3 \
+                RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) \
+             FROM large",
+        )
+        .await?;
+        assert_eq!(wraps, 0);
+        Ok(())
+    }
+
+    // AQE re-runs the optimizer chain on every stage boundary. If the rule
+    // isn't idempotent, each replan nests another marker → the plan grows
+    // one layer per iteration and AQE never converges (real regression we
+    // hit against a live cluster before this test existed).
+    #[tokio::test]
+    async fn rule_is_idempotent_across_reruns() -> datafusion::common::Result<()> {
+        let plan = plan(
+            "SELECT sum(v2) OVER (ORDER BY v2 \
+                RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) \
+             FROM large",
+        )
+        .await?;
+        let config = ConfigOptions::new();
+        let once = ParallelWindowDetectRule.optimize(plan, &config)?;
+        let count_after_once = count_markers(&once);
+        let twice = ParallelWindowDetectRule.optimize(once, &config)?;
+        let count_after_twice = count_markers(&twice);
+        assert_eq!(
+            count_after_once, 1,
+            "first pass should insert exactly one marker"
+        );
+        assert_eq!(
+            count_after_twice, 1,
+            "second pass must not add another marker"
+        );
+        Ok(())
+    }
+
+    fn count_markers(plan: &Arc<dyn ExecutionPlan>) -> usize {
+        let mut count = 0;
+        plan.apply(|node| {
+            if node.downcast_ref::<DynamicRangeRepartitionExec>().is_some() {
+                count += 1;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("apply is infallible for pure counting closure");
+        count
+    }
+
+    // Positional check: the wrap lands directly under BWAG, not somewhere
+    // else in the tree.
+    #[tokio::test]
+    async fn wraps_land_directly_under_bwag() -> datafusion::common::Result<()> {
+        use datafusion::physical_plan::windows::BoundedWindowAggExec;
+
+        let plan = plan(
+            "SELECT sum(v2) OVER (ORDER BY v2 \
+                RANGE BETWEEN 3 PRECEDING AND CURRENT ROW) \
+             FROM large",
+        )
+        .await?;
+        let rewritten = ParallelWindowDetectRule.optimize(plan, &ConfigOptions::new())?;
+        let mut found = false;
+        rewritten.apply(|node| {
+            if node.downcast_ref::<BoundedWindowAggExec>().is_some() {
+                let children = node.children();
+                let [bwag_input] = children.as_slice() else {
+                    unreachable!("BWAG has exactly one child")
+                };
+                if bwag_input
+                    .downcast_ref::<DynamicRangeRepartitionExec>()
+                    .is_some()
+                {
+                    found = true;
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert!(
+            found,
+            "BWAG's direct child must be DynamicRangeRepartitionExec"
+        );
         Ok(())
     }
 }
