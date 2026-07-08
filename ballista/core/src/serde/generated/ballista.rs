@@ -54,7 +54,7 @@ pub mod ballista_physical_plan_node {
         #[prost(message, tag = "6")]
         DynamicRangeRepartition(super::DynamicRangeRepartitionExecNode),
         #[prost(message, tag = "7")]
-        QuantileSketch(super::QuantileSketchExecNode),
+        RuntimeStats(super::RuntimeStatsExecNode),
     }
 }
 /// Range-partition marker for the parallel-window path. Currently a
@@ -73,16 +73,20 @@ pub struct DynamicRangeRepartitionExecNode {
         ::datafusion_proto::protobuf::PhysicalSortExprNode,
     >,
 }
-/// Quantile-sketch tap for the parallel-window path. Passes batches through
-/// unmodified while accumulating a quantile sketch (T-Digest today, KLL
-/// later) over the first ORDER BY expression's Float64 values. Downstream
-/// operators inside the same Ballista task read the sketch via a child-tree
-/// walk. The child plan is plumbed by the framework as `inputs\[0\]`.
+/// Runtime-stats tap for the parallel-window path. Passes batches through
+/// unmodified while accumulating:
+///
+/// * per-partition row counts (always)
+/// * a quantile sketch over the first ORDER BY expression's Float64 values
+///   (only when order_by is non-empty)
+///   Downstream operators inside the same Ballista task read the stats via a
+///   child-tree walk. The child plan is plumbed by the framework as `inputs\[0\]`.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct QuantileSketchExecNode {
-    /// Lexicographic ORDER BY. First entry drives the sketch; the rest are
-    /// preserved for downstream operators (SortExec, BWAG) that need the
-    /// full ordering.
+pub struct RuntimeStatsExecNode {
+    /// Optional lexicographic ORDER BY. Empty means row-count-only mode
+    /// (no sketch allocated). When non-empty, the first entry drives the
+    /// sketch and the rest are preserved for downstream operators
+    /// (SortExec, BWAG) that need the full ordering.
     #[prost(message, repeated, tag = "1")]
     pub order_by: ::prost::alloc::vec::Vec<
         ::datafusion_proto::protobuf::PhysicalSortExprNode,

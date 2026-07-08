@@ -59,7 +59,7 @@ use std::{convert::TryInto, io::Cursor};
 use crate::execution_plans::sort_shuffle::SortShuffleConfig;
 use crate::execution_plans::{
     ChaosExec, CoalescePlan, DynamicRangeRepartitionExec, PartitionGroup,
-    QuantileSketchExec, ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec,
+    RuntimeStatsExec, ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec,
     UnresolvedShuffleExec,
 };
 use crate::serde::protobuf::{
@@ -570,20 +570,26 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     order_by,
                 )?))
             }
-            PhysicalPlanType::QuantileSketch(node) => {
+            PhysicalPlanType::RuntimeStats(node) => {
                 let [input] = inputs else {
                     return Err(DataFusionError::Internal(format!(
-                        "QuantileSketchExec expects exactly 1 input, got {}",
+                        "RuntimeStatsExec expects exactly 1 input, got {}",
                         inputs.len()
                     )));
                 };
-                let order_by = parse_physical_sort_exprs(
-                    &node.order_by,
-                    &decode_ctx,
-                    input.schema().as_ref(),
-                    &converter,
-                )?;
-                Ok(Arc::new(QuantileSketchExec::try_new(
+                // Empty proto vec means row-count-only mode; a non-empty
+                // vec is the ORDER BY that drives the quantile sketch.
+                let order_by = if node.order_by.is_empty() {
+                    None
+                } else {
+                    Some(parse_physical_sort_exprs(
+                        &node.order_by,
+                        &decode_ctx,
+                        input.schema().as_ref(),
+                        &converter,
+                    )?)
+                };
+                Ok(Arc::new(RuntimeStatsExec::try_new(
                     input.clone(),
                     order_by,
                 )?))
@@ -781,21 +787,26 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 ))
             })?;
             Ok(())
-        } else if let Some(exec) = node.downcast_ref::<QuantileSketchExec>() {
+        } else if let Some(exec) = node.downcast_ref::<RuntimeStatsExec>() {
             let converter = DefaultPhysicalProtoConverter {};
-            let order_by = serialize_physical_sort_exprs(
-                exec.order_by().iter().cloned(),
-                self.default_codec.as_ref(),
-                &converter,
-            )?;
+            // Empty vec on the wire when the operator is in row-count-only
+            // mode; otherwise serialise the full ORDER BY.
+            let order_by = match exec.order_by() {
+                Some(exprs) => serialize_physical_sort_exprs(
+                    exprs.iter().cloned(),
+                    self.default_codec.as_ref(),
+                    &converter,
+                )?,
+                None => Vec::new(),
+            };
             let proto = protobuf::BallistaPhysicalPlanNode {
-                physical_plan_type: Some(PhysicalPlanType::QuantileSketch(
-                    protobuf::QuantileSketchExecNode { order_by },
+                physical_plan_type: Some(PhysicalPlanType::RuntimeStats(
+                    protobuf::RuntimeStatsExecNode { order_by },
                 )),
             };
             proto.encode(buf).map_err(|e| {
                 DataFusionError::Internal(format!(
-                    "failed to encode QuantileSketchExec: {e:?}"
+                    "failed to encode RuntimeStatsExec: {e:?}"
                 ))
             })?;
             Ok(())
@@ -1411,12 +1422,11 @@ mod test {
         assert!(!decoded_order_by[1].options.nulls_first);
     }
 
-    /// `QuantileSketchExec` round-trips its ORDER BY the same way
-    /// `DynamicRangeRepartitionExec` does. Also asserts the accessor
-    /// exists and returns a fresh (empty) sketch on a just-decoded operator
-    /// — no batches have flowed through the decoded instance yet.
+    /// `RuntimeStatsExec` in sketching mode round-trips its ORDER BY and
+    /// keeps the sketch accessor available. Row-count accessor is always
+    /// available (and empty on a fresh operator).
     #[tokio::test]
-    async fn test_quantile_sketch_exec_roundtrip() {
+    async fn test_runtime_stats_exec_roundtrip_with_sketch() {
         use datafusion::arrow::compute::SortOptions;
         use datafusion::physical_expr::PhysicalSortExpr;
         use datafusion::physical_plan::empty::EmptyExec;
@@ -1434,12 +1444,16 @@ mod test {
             },
         };
         let original =
-            QuantileSketchExec::try_new(input.clone(), vec![sort_expr.clone()]).unwrap();
-        // Fresh sketch is empty (count 0) before any batches flow through.
+            RuntimeStatsExec::try_new(input.clone(), Some(vec![sort_expr.clone()]))
+                .unwrap();
+        // Fresh operator: row-count zero, sketch present but empty.
         // EmptyExec exposes one partition, so partition-0 is the only slot.
-        assert_eq!(original.quantile_sketch(0).unwrap().count(), 0.0);
-        assert_eq!(original.merged_quantile_sketch().count(), 0.0);
+        assert_eq!(original.row_count(0).unwrap(), 0);
+        assert_eq!(original.total_row_count(), 0);
+        assert_eq!(original.quantile_sketch(0).unwrap().unwrap().count(), 0.0);
+        assert_eq!(original.merged_quantile_sketch().unwrap().count(), 0.0);
         // Out-of-range partition surfaces as an internal error, not a panic.
+        assert!(original.row_count(1).is_err());
         assert!(original.quantile_sketch(1).is_err());
 
         let codec = BallistaPhysicalExtensionCodec::default();
@@ -1450,14 +1464,53 @@ mod test {
         let decoded_plan = codec.try_decode(&buf, &[input], &ctx).unwrap();
 
         let decoded = decoded_plan
-            .downcast_ref::<QuantileSketchExec>()
-            .expect("Expected QuantileSketchExec");
-        let order_by = decoded.order_by();
+            .downcast_ref::<RuntimeStatsExec>()
+            .expect("Expected RuntimeStatsExec");
+        let order_by = decoded
+            .order_by()
+            .expect("sketching mode preserves order_by");
         assert_eq!(order_by.len(), 1);
         assert_eq!(order_by[0].expr.to_string(), sort_expr.expr.to_string());
         assert!(!order_by[0].options.descending);
-        assert_eq!(decoded.quantile_sketch(0).unwrap().count(), 0.0);
-        assert_eq!(decoded.merged_quantile_sketch().count(), 0.0);
+        assert_eq!(decoded.row_count(0).unwrap(), 0);
+        assert_eq!(decoded.quantile_sketch(0).unwrap().unwrap().count(), 0.0);
+        assert_eq!(decoded.merged_quantile_sketch().unwrap().count(), 0.0);
+    }
+
+    /// `RuntimeStatsExec` in row-count-only mode (Stage-2 usage) —
+    /// `order_by = None`. Sketch accessors return `None`; row-count
+    /// accessors work.
+    #[tokio::test]
+    async fn test_runtime_stats_exec_roundtrip_row_count_only() {
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v2",
+            DataType::Float64,
+            false,
+        )]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let original = RuntimeStatsExec::try_new(input.clone(), None).unwrap();
+        assert!(original.order_by().is_none());
+        assert_eq!(original.row_count(0).unwrap(), 0);
+        assert!(
+            original.quantile_sketch(0).unwrap().is_none(),
+            "no sketch was requested at construction"
+        );
+        assert!(original.merged_quantile_sketch().is_none());
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec.try_encode(Arc::new(original), &mut buf).unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec.try_decode(&buf, &[input], &ctx).unwrap();
+        let decoded = decoded_plan
+            .downcast_ref::<RuntimeStatsExec>()
+            .expect("Expected RuntimeStatsExec");
+        assert!(decoded.order_by().is_none());
+        assert!(decoded.quantile_sketch(0).unwrap().is_none());
+        assert!(decoded.merged_quantile_sketch().is_none());
     }
 
     /// `try_new` refuses an empty ORDER BY — no routing key means the

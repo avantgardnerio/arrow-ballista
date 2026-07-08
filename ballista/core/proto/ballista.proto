@@ -52,7 +52,7 @@ message BallistaPhysicalPlanNode {
     SortShuffleWriterExecNode sort_shuffle_writer = 4;
     ChaosExecNode chaos_exec = 5;
     DynamicRangeRepartitionExecNode dynamic_range_repartition = 6;
-    QuantileSketchExecNode quantile_sketch = 7;
+    RuntimeStatsExecNode runtime_stats = 7;
   }
 }
 
@@ -69,15 +69,18 @@ message DynamicRangeRepartitionExecNode {
   repeated datafusion.PhysicalSortExprNode order_by = 1;
 }
 
-// Quantile-sketch tap for the parallel-window path. Passes batches through
-// unmodified while accumulating a quantile sketch (T-Digest today, KLL
-// later) over the first ORDER BY expression's Float64 values. Downstream
-// operators inside the same Ballista task read the sketch via a child-tree
-// walk. The child plan is plumbed by the framework as `inputs[0]`.
-message QuantileSketchExecNode {
-  // Lexicographic ORDER BY. First entry drives the sketch; the rest are
-  // preserved for downstream operators (SortExec, BWAG) that need the
-  // full ordering.
+// Runtime-stats tap for the parallel-window path. Passes batches through
+// unmodified while accumulating:
+//   * per-partition row counts (always)
+//   * a quantile sketch over the first ORDER BY expression's Float64 values
+//     (only when order_by is non-empty)
+// Downstream operators inside the same Ballista task read the stats via a
+// child-tree walk. The child plan is plumbed by the framework as `inputs[0]`.
+message RuntimeStatsExecNode {
+  // Optional lexicographic ORDER BY. Empty means row-count-only mode
+  // (no sketch allocated). When non-empty, the first entry drives the
+  // sketch and the rest are preserved for downstream operators
+  // (SortExec, BWAG) that need the full ordering.
   repeated datafusion.PhysicalSortExprNode order_by = 1;
 }
 
