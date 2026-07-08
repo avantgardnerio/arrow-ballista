@@ -31,7 +31,7 @@ pub struct LogicalPlanCacheNode {
 pub struct BallistaPhysicalPlanNode {
     #[prost(
         oneof = "ballista_physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 5, 6"
+        tags = "1, 2, 3, 4, 5, 6, 7"
     )]
     pub physical_plan_type: ::core::option::Option<
         ballista_physical_plan_node::PhysicalPlanType,
@@ -53,13 +53,41 @@ pub mod ballista_physical_plan_node {
         ChaosExec(super::ChaosExecNode),
         #[prost(message, tag = "6")]
         DynamicRangeRepartition(super::DynamicRangeRepartitionExecNode),
+        #[prost(message, tag = "7")]
+        QuantileSketch(super::QuantileSketchExecNode),
     }
 }
-/// Passthrough marker for parallel-window range partitioning. The child
-/// plan is plumbed by the framework as `inputs\[0\]` during decode, so this
-/// message carries no fields.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct DynamicRangeRepartitionExecNode {}
+/// Range-partition marker for the parallel-window path. Currently a
+/// pass-through inserted above BWAG by the detection rule; upcoming commits
+/// grow it into a value-range router that consumes an upstream
+/// `QuantileSketchExec`'s sketch via a child-tree walk. The child plan is
+/// plumbed by the framework as `inputs\[0\]` during decode.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DynamicRangeRepartitionExecNode {
+    /// Lexicographic ORDER BY carried through from the wrapping window
+    /// operator. The eventual router reads only the first key for value
+    /// routing, but the full ordering is preserved so ROWS-frame (rank-based)
+    /// routing can be added later without a schema break.
+    #[prost(message, repeated, tag = "1")]
+    pub order_by: ::prost::alloc::vec::Vec<
+        ::datafusion_proto::protobuf::PhysicalSortExprNode,
+    >,
+}
+/// Quantile-sketch tap for the parallel-window path. Passes batches through
+/// unmodified while accumulating a quantile sketch (T-Digest today, KLL
+/// later) over the first ORDER BY expression's Float64 values. Downstream
+/// operators inside the same Ballista task read the sketch via a child-tree
+/// walk. The child plan is plumbed by the framework as `inputs\[0\]`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct QuantileSketchExecNode {
+    /// Lexicographic ORDER BY. First entry drives the sketch; the rest are
+    /// preserved for downstream operators (SortExec, BWAG) that need the
+    /// full ordering.
+    #[prost(message, repeated, tag = "1")]
+    pub order_by: ::prost::alloc::vec::Vec<
+        ::datafusion_proto::protobuf::PhysicalSortExprNode,
+    >,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChaosExecNode {
     #[prost(double, tag = "1")]

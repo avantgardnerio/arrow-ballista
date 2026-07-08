@@ -52,13 +52,33 @@ message BallistaPhysicalPlanNode {
     SortShuffleWriterExecNode sort_shuffle_writer = 4;
     ChaosExecNode chaos_exec = 5;
     DynamicRangeRepartitionExecNode dynamic_range_repartition = 6;
+    QuantileSketchExecNode quantile_sketch = 7;
   }
 }
 
-// Passthrough marker for parallel-window range partitioning. The child
-// plan is plumbed by the framework as `inputs[0]` during decode, so this
-// message carries no fields.
+// Range-partition marker for the parallel-window path. Currently a
+// pass-through inserted above BWAG by the detection rule; upcoming commits
+// grow it into a value-range router that consumes an upstream
+// `QuantileSketchExec`'s sketch via a child-tree walk. The child plan is
+// plumbed by the framework as `inputs[0]` during decode.
 message DynamicRangeRepartitionExecNode {
+  // Lexicographic ORDER BY carried through from the wrapping window
+  // operator. The eventual router reads only the first key for value
+  // routing, but the full ordering is preserved so ROWS-frame (rank-based)
+  // routing can be added later without a schema break.
+  repeated datafusion.PhysicalSortExprNode order_by = 1;
+}
+
+// Quantile-sketch tap for the parallel-window path. Passes batches through
+// unmodified while accumulating a quantile sketch (T-Digest today, KLL
+// later) over the first ORDER BY expression's Float64 values. Downstream
+// operators inside the same Ballista task read the sketch via a child-tree
+// walk. The child plan is plumbed by the framework as `inputs[0]`.
+message QuantileSketchExecNode {
+  // Lexicographic ORDER BY. First entry drives the sketch; the rest are
+  // preserved for downstream operators (SortExec, BWAG) that need the
+  // full ordering.
+  repeated datafusion.PhysicalSortExprNode order_by = 1;
 }
 
 message ChaosExecNode {

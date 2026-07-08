@@ -1086,6 +1086,7 @@ dependencies = [
  "chrono",
  "clap 4.6.1",
  "datafusion",
+ "datafusion-functions-aggregate-common",
  "datafusion-proto",
  "datafusion-proto-common",
  "datafusion-spark",

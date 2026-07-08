@@ -31,9 +31,13 @@ use datafusion_proto::logical_plan::file_formats::{
     ArrowLogicalExtensionCodec, AvroLogicalExtensionCodec, CsvLogicalExtensionCodec,
     JsonLogicalExtensionCodec, ParquetLogicalExtensionCodec,
 };
-use datafusion_proto::physical_plan::from_proto::parse_protobuf_hash_partitioning;
-use datafusion_proto::physical_plan::from_proto::parse_protobuf_partitioning;
-use datafusion_proto::physical_plan::to_proto::serialize_partitioning;
+use datafusion_proto::physical_plan::from_proto::{
+    parse_physical_sort_exprs, parse_protobuf_hash_partitioning,
+    parse_protobuf_partitioning,
+};
+use datafusion_proto::physical_plan::to_proto::{
+    serialize_partitioning, serialize_physical_sort_exprs,
+};
 use datafusion_proto::physical_plan::{
     DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
     PhysicalPlanDecodeContext,
@@ -55,7 +59,8 @@ use std::{convert::TryInto, io::Cursor};
 use crate::execution_plans::sort_shuffle::SortShuffleConfig;
 use crate::execution_plans::{
     ChaosExec, CoalescePlan, DynamicRangeRepartitionExec, PartitionGroup,
-    ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec, UnresolvedShuffleExec,
+    QuantileSketchExec, ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec,
+    UnresolvedShuffleExec,
 };
 use crate::serde::protobuf::{
     ballista_logical_plan_node::LogicalPlanType,
@@ -547,15 +552,40 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     Some(chaos_exec.seed),
                 )?))
             }
-            PhysicalPlanType::DynamicRangeRepartition(_) => {
+            PhysicalPlanType::DynamicRangeRepartition(node) => {
                 let [input] = inputs else {
                     return Err(DataFusionError::Internal(format!(
                         "DynamicRangeRepartitionExec expects exactly 1 input, got {}",
                         inputs.len()
                     )));
                 };
+                let order_by = parse_physical_sort_exprs(
+                    &node.order_by,
+                    &decode_ctx,
+                    input.schema().as_ref(),
+                    &converter,
+                )?;
                 Ok(Arc::new(DynamicRangeRepartitionExec::try_new(
                     input.clone(),
+                    order_by,
+                )?))
+            }
+            PhysicalPlanType::QuantileSketch(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "QuantileSketchExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                let order_by = parse_physical_sort_exprs(
+                    &node.order_by,
+                    &decode_ctx,
+                    input.schema().as_ref(),
+                    &converter,
+                )?;
+                Ok(Arc::new(QuantileSketchExec::try_new(
+                    input.clone(),
+                    order_by,
                 )?))
             }
         }
@@ -733,15 +763,39 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 ))
             })?;
             Ok(())
-        } else if node.downcast_ref::<DynamicRangeRepartitionExec>().is_some() {
+        } else if let Some(exec) = node.downcast_ref::<DynamicRangeRepartitionExec>() {
+            let converter = DefaultPhysicalProtoConverter {};
+            let order_by = serialize_physical_sort_exprs(
+                exec.order_by().iter().cloned(),
+                self.default_codec.as_ref(),
+                &converter,
+            )?;
             let proto = protobuf::BallistaPhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::DynamicRangeRepartition(
-                    protobuf::DynamicRangeRepartitionExecNode {},
+                    protobuf::DynamicRangeRepartitionExecNode { order_by },
                 )),
             };
             proto.encode(buf).map_err(|e| {
                 DataFusionError::Internal(format!(
                     "failed to encode DynamicRangeRepartitionExec: {e:?}"
+                ))
+            })?;
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<QuantileSketchExec>() {
+            let converter = DefaultPhysicalProtoConverter {};
+            let order_by = serialize_physical_sort_exprs(
+                exec.order_by().iter().cloned(),
+                self.default_codec.as_ref(),
+                &converter,
+            )?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::QuantileSketch(
+                    protobuf::QuantileSketchExecNode { order_by },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode QuantileSketchExec: {e:?}"
                 ))
             })?;
             Ok(())
@@ -1260,5 +1314,168 @@ mod test {
         assert!(decoded_exec.broadcast);
         assert_eq!(decoded_exec.upstream_partition_count, 4);
         assert_eq!(decoded_exec.partition.len(), 1);
+    }
+
+    /// The wrapper carries its ORDER BY across the network so the executor's
+    /// sampler knows which column to route on. Round-trip a single-key
+    /// ordering to guard the codec's happy path.
+    #[tokio::test]
+    async fn test_dynamic_range_repartition_exec_roundtrip_single_key() {
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::PhysicalSortExpr;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v2", DataType::Float64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("v2", schema.as_ref()).unwrap(),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        let original =
+            DynamicRangeRepartitionExec::try_new(input.clone(), vec![sort_expr.clone()])
+                .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec.try_encode(Arc::new(original), &mut buf).unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec.try_decode(&buf, &[input], &ctx).unwrap();
+
+        let decoded = decoded_plan
+            .downcast_ref::<DynamicRangeRepartitionExec>()
+            .expect("Expected DynamicRangeRepartitionExec");
+        let order_by = decoded.order_by();
+        assert_eq!(order_by.len(), 1, "single-key ORDER BY should round-trip");
+        assert_eq!(order_by[0].expr.to_string(), sort_expr.expr.to_string());
+        assert!(!order_by[0].options.descending);
+        assert!(order_by[0].options.nulls_first);
+    }
+
+    /// The API accepts multi-key lexicographic ordering (RANGE-frame windows
+    /// only route on the first key, but the wire format must not drop the
+    /// rest — that's the ROWS-frame follow-up's substrate).
+    #[tokio::test]
+    async fn test_dynamic_range_repartition_exec_roundtrip_multi_key() {
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::PhysicalSortExpr;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v2", DataType::Float64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let order_by = vec![
+            PhysicalSortExpr {
+                expr: col("v2", schema.as_ref()).unwrap(),
+                options: SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            },
+            PhysicalSortExpr {
+                expr: col("id", schema.as_ref()).unwrap(),
+                options: SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            },
+        ];
+        let original =
+            DynamicRangeRepartitionExec::try_new(input.clone(), order_by.clone())
+                .unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec.try_encode(Arc::new(original), &mut buf).unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec.try_decode(&buf, &[input], &ctx).unwrap();
+
+        let decoded = decoded_plan
+            .downcast_ref::<DynamicRangeRepartitionExec>()
+            .expect("Expected DynamicRangeRepartitionExec");
+        let decoded_order_by = decoded.order_by();
+        assert_eq!(decoded_order_by.len(), 2, "multi-key ORDER BY must survive");
+        assert!(
+            decoded_order_by[1].options.descending,
+            "sort options must survive per-key"
+        );
+        assert!(!decoded_order_by[1].options.nulls_first);
+    }
+
+    /// `QuantileSketchExec` round-trips its ORDER BY the same way
+    /// `DynamicRangeRepartitionExec` does. Also asserts the accessor
+    /// exists and returns a fresh (empty) sketch on a just-decoded operator
+    /// — no batches have flowed through the decoded instance yet.
+    #[tokio::test]
+    async fn test_quantile_sketch_exec_roundtrip() {
+        use datafusion::arrow::compute::SortOptions;
+        use datafusion::physical_expr::PhysicalSortExpr;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v2", DataType::Float64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let sort_expr = PhysicalSortExpr {
+            expr: col("v2", schema.as_ref()).unwrap(),
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        };
+        let original =
+            QuantileSketchExec::try_new(input.clone(), vec![sort_expr.clone()]).unwrap();
+        // Fresh sketch is empty (count 0) before any batches flow through.
+        // EmptyExec exposes one partition, so partition-0 is the only slot.
+        assert_eq!(original.quantile_sketch(0).unwrap().count(), 0.0);
+        assert_eq!(original.merged_quantile_sketch().count(), 0.0);
+        // Out-of-range partition surfaces as an internal error, not a panic.
+        assert!(original.quantile_sketch(1).is_err());
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec.try_encode(Arc::new(original), &mut buf).unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec.try_decode(&buf, &[input], &ctx).unwrap();
+
+        let decoded = decoded_plan
+            .downcast_ref::<QuantileSketchExec>()
+            .expect("Expected QuantileSketchExec");
+        let order_by = decoded.order_by();
+        assert_eq!(order_by.len(), 1);
+        assert_eq!(order_by[0].expr.to_string(), sort_expr.expr.to_string());
+        assert!(!order_by[0].options.descending);
+        assert_eq!(decoded.quantile_sketch(0).unwrap().count(), 0.0);
+        assert_eq!(decoded.merged_quantile_sketch().count(), 0.0);
+    }
+
+    /// `try_new` refuses an empty ORDER BY — no routing key means the
+    /// downstream sampler has nothing to sample.
+    #[test]
+    fn test_dynamic_range_repartition_exec_rejects_empty_order_by() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v2",
+            DataType::Float64,
+            false,
+        )]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let err = DynamicRangeRepartitionExec::try_new(input, vec![])
+            .expect_err("empty ORDER BY must be rejected — no routing key to sample on");
+        assert!(
+            err.to_string().contains("at least one ORDER BY expression"),
+            "error should name the missing invariant, got: {err}"
+        );
     }
 }

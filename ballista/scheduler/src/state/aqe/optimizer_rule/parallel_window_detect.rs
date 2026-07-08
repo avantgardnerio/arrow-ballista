@@ -82,9 +82,11 @@ impl PhysicalOptimizerRule for ParallelWindowDetectRule {
                     children.len()
                 );
             };
-            let wrapped: Arc<dyn ExecutionPlan> = Arc::new(
-                DynamicRangeRepartitionExec::try_new((*bwag_input).clone())?,
-            );
+            let wrapped: Arc<dyn ExecutionPlan> =
+                Arc::new(DynamicRangeRepartitionExec::try_new(
+                    (*bwag_input).clone(),
+                    bwag.order_by.clone(),
+                )?);
             let new_bwag = node.with_new_children(vec![wrapped])?;
             // Jump past the rewritten node's children — the BWAG we just
             // reconstructed still matches `as_candidate` by shape, and
@@ -105,9 +107,13 @@ impl PhysicalOptimizerRule for ParallelWindowDetectRule {
 
 /// Fields extracted from a matching `BoundedWindowAggExec` — everything the
 /// rewrite will eventually need to plant a `DynamicRangeRepartitionExec`.
-#[derive(Debug, Clone, PartialEq)]
+/// Carries the full lexicographic ORDER BY (not just the routing key name)
+/// so the wrapping operator can accept it verbatim; today the sampler only
+/// uses the first entry, but the API is shape-general.
+#[derive(Debug, Clone)]
 struct BwagCandidate {
     order_key: String,
+    order_by: Vec<datafusion::physical_expr::PhysicalSortExpr>,
     start_bound: WindowFrameBound,
     end_bound: WindowFrameBound,
 }
@@ -150,6 +156,7 @@ fn as_candidate(node: &dyn ExecutionPlan) -> Option<BwagCandidate> {
     };
     Some(BwagCandidate {
         order_key: order_column.name().to_string(),
+        order_by: window_expr.order_by().to_vec(),
         start_bound: start.clone(),
         end_bound: end.clone(),
     })
