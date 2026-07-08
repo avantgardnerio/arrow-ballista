@@ -1,0 +1,89 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+digraph kll_technique {
+  rankdir=TB;
+  ranksep=0.7;
+  nodesep=0.5;
+  fontname="Helvetica";
+  labelloc=t;
+  fontsize=15;
+  label=<<b>KLL-adaptive Range Repartition · with halo (HaloDropExec)</b><br/>4 execs × 4 cores = 16 parallel tasks · bounded RANGE frame · symmetric halo (PRECEDING + FOLLOWING) · client concat>;
+  bgcolor="#f6f4ee";
+
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fillcolor=white, fontsize=10];
+  edge [fontname="Helvetica", fontsize=9, arrowsize=0.7];
+
+  //////////////////////// Stage 1 ////////////////////////
+  subgraph cluster_s1 {
+    label=<<b>Stage 1</b> · per-executor, streaming (KLL dam-break, no sort, halo-oblivious)>;
+    labeljust=l; fontsize=12;
+    style=dashed; color="#4a7ba6"; bgcolor="#eef7ff";
+
+    E1 [label=<<b>Exec 1</b> · 4 files<br align="left"/>Scan → KllExec (until dam-break)<br align="left"/><b>at dam-break: pick k_1 locally</b><br align="left"/>  k_1 = clamp(k_min, bytes/100MB, k_max)<br align="left"/>  (parquet stats + KLL distribution)<br align="left"/>RangeRepart (k_1 sub-parts, ex: 16)<br align="left"/>shuffle-write s1_1..s1_k1 (unsorted)<br align="left"/>local bounds b1_1..b1_k1<br align="left"/>>, fillcolor="#dceffb"];
+    E2 [label=<<b>Exec 2</b> · 4 files<br align="left"/>Scan · KLL · dam-break → pick k_2<br align="left"/>RangeRepart (k_2 sub-parts, ex: 16)<br align="left"/>shuffle-write s2_1..s2_k2<br align="left"/>local bounds b2_1..b2_k2<br align="left"/>>, fillcolor="#dceffb"];
+    E3 [label=<<b>Exec 3</b> · 4 files<br align="left"/>Scan · KLL · dam-break → pick k_3<br align="left"/>(dense slice → k_3 might be 30-40)<br align="left"/>RangeRepart · shuffle-write s3_1..s3_k3<br align="left"/>>, fillcolor="#dceffb"];
+    E4 [label=<<b>Exec 4</b> · 4 files<br align="left"/>Scan · KLL · dam-break → pick k_4<br align="left"/>RangeRepart · shuffle-write s4_1..s4_k4<br align="left"/>>, fillcolor="#dceffb"];
+    { rank=same; E1; E2; E3; E4; }
+  }
+
+  //////////////////////// Scheduler barrier ////////////////////////
+  scheduler [
+    label=<<b>Scheduler barrier</b><br align="left"/>inputs: local bounds/counts × 4 execs (heterogeneous k_i), <b>halo_lo</b>/<b>halo_hi</b> (from WindowFrame)<br align="left"/>bin-pack Σk_i sub-parts → <b>16 range partitions</b><br align="left"/>  · objective: even value-range width<br align="left"/>  · invariant: ties on v2 stay together<br align="left"/>  · lookup range for partition i: <b>[g_i - halo_lo, g_{i+1} + halo_hi]</b> (halo both sides)<br align="left"/>  · bin-packer may split sub-parts (must, on overlap); tolerates heterogeneous k_i<br align="left"/>derive global cuts [g0..g16]<br align="left"/>emit assignment (pull-list, keep_range=[g_i, g_{i+1})) per partition-id 0..15<br align="left"/>>,
+    shape=hexagon, fillcolor="#ffe6a3", style=filled, fontsize=10
+  ];
+
+  //////////////////////// Stage 2 ////////////////////////
+  subgraph cluster_s2 {
+    label=<<b>Stage 2</b> · 16 parallel Ballista tasks · full window per range, halo labelled at pull time>;
+    labeljust=l; fontsize=12;
+    style=dashed; color="#a6584a"; bgcolor="#fff0ee";
+
+    S1 [label=<<b>Exec 1</b> · runs 4 tasks (partition-ids 0..3, ranges [g0..g4])<br align="left"/>each task's physical plan:<br align="left"/>  ShuffleReader (~3-5 assigned sub-parts, 64/16 avg)<br align="left"/>  → FilterExec (keep v2 ∈ [g_i - halo_lo, g_{i+1} + halo_hi])<br align="left"/>  → SortExec[v2 asc]<br align="left"/>  → SPM (N → 1)<br align="left"/>  → BoundedWindowAggExec<br align="left"/>  → <b>HaloDropExec { keep_range: [g_i, g_{i+1}) }</b> ← custom op, pushdown-immune<br align="left"/>  → shuffle-write partition-id i<br align="left"/>>, fillcolor="#fbdcd6"];
+    S2 [label=<<b>Exec 2</b> · tasks p4..p7 ([g4..g8])<br align="left"/>same plan · 4 concurrent tasks<br align="left"/>>, fillcolor="#fbdcd6"];
+    S3 [label=<<b>Exec 3</b> · tasks p8..p11 ([g8..g12])<br align="left"/>same plan · 4 concurrent tasks<br align="left"/>>, fillcolor="#fbdcd6"];
+    S4 [label=<<b>Exec 4</b> · tasks p12..p15 ([g12..g16])<br align="left"/>same plan · 4 concurrent tasks<br align="left"/>>, fillcolor="#fbdcd6"];
+    { rank=same; S1; S2; S3; S4; }
+  }
+
+  client [label=<<b>Client / DistributedQueryExec</b><br/>pulls partition-ids 0..15 in order, serial flatten → 1 sorted stream>, shape=oval, fillcolor="#b8d5ee"];
+
+  legend [shape=note, fillcolor="#fffbe4", fontsize=9,
+          label="Halo mechanism (bounded RANGE frame, numeric ORDER BY)\l──────────────────────────────────────────────\l  · halo_lo = WindowFrame's PRECEDING extent in value units (e.g. 3 for RANGE 3 PRECEDING)\l  · halo_hi = WindowFrame's FOLLOWING extent in value units (0 if frame ends at CURRENT ROW)\l  · Stage 1's RangeRepart stays halo-oblivious — sub-parts locally disjoint, no dup rows\l  · scheduler math: task i's fetch range = [g_i - halo_lo, g_{i+1} + halo_hi]\l  · BWAG sees halo rows on both sides and includes them in frames of real rows\l  · HaloDropExec keeps only v2 ∈ [g_i, g_{i+1}) after BWAG — halo rows vanish\l  · edges: g_0 = -∞ (no low halo needed), g_16 = +∞ (no high halo needed); planner elides\l\lFrame shapes this covers\l  · RANGE N PRECEDING AND CURRENT ROW           (halo_lo=N,  halo_hi=0)\l  · RANGE CURRENT ROW AND M FOLLOWING           (halo_lo=0,  halo_hi=M)\l  · RANGE N PRECEDING AND M FOLLOWING           (halo_lo=N,  halo_hi=M)\l  · NOT covered: UNBOUNDED PRECEDING / FOLLOWING (halo would span the world; needs\l    two-pass running-agg propagation instead — separate technique)\l\lWhy HaloDropExec is a custom op, not a FilterExec + __is_halo column\l  · DF's PushDownFilter would chase a standard filter downward through Sort/SPM/BWAG\l  · pushdown is bounded only by the column-adding projection — putting that projection\l    below BWAG lets pushdown drop halo rows BEFORE they feed frames (silent corruption)\l  · custom physical ops are invisible to the standard pushdown rules — optimizer walks over\l  · no schema growth, no projection dance, no correctness footgun\l\lWhy this doesn't cover non-continuous ORDER BY (strings, etc.)\l  · SQL only permits RANGE frames on numeric/datetime/interval types\l  · string ORDER BY forces ROWS frames — halo becomes row-count-based, needs\l    Stage 1 to emit sub-part row counts and scheduler to bin-pack on cumulative rank\l  · ROWS-frame follow-up; deferred, not blocking the RANGE ship\l\lWhy no ConcatOrderedBatchesExec\l  · execution_stage.rs:1089 emits partitions in id order\l  · distributed_query.rs:579 client uses serial `stream::iter(...).flatten()`\l  · partition 0 fully drains before partition 1 → global sort by construction\l\lBin-pack:\l  · target = 16 range partitions (partition-id i owns [g_i, g_{i+1}) output)\l  · objective = even value-range width\l  · half-open [g_i, g_{i+1}) is the tie-handling convention — all v2 == g_i go to partition i\l  · splits sub-parts freely (overlap forces it anyway)\l  · halo_lo/halo_hi must be &lt; partition width, else pull spans &gt;1 neighbor and read amp blows up\l\lPlan-time fallbacks to naive single-partition BWAG plan\l  · halo_span > partition_width × threshold (e.g. 0.5) → don't halo &gt;50% of the data\l  · single v2 value's frequency > 1/target_partitions → hot-value skew, can't bin-pack around it\l  · partition_width and frequency estimated from parquet column stats at plan time\l\lDynamic k (each exec picks its own k_i at dam-break)\l  · k_i = clamp(k_min, ceil(local_bytes / target_subpart_bytes), k_max)\l  · target_subpart_bytes ≈ 100 MB (shuffle metadata floor)\l  · k_min = ceil(target_partitions × oversample / n_execs)   — bin-pack flexibility floor\l  · k_max ≈ KLL_internal_K / margin (~25-50 for default K=200) — sketch resolution ceiling\l  · at dam-break, exec knows exact local row count (parquet), extrapolated byte size, and\l    real distribution (KLL) — enough to make an informed local decision\l  · bin-packer at scheduler tolerates heterogeneous k_i: dense execs emit more, sparse fewer\l  · this is how the design absorbs skew: hot slices split themselves before shuffle-write\l\lWhy oversampling matters at all (whichever k formula)\l  · k too small → bin-packer has no degrees of freedom → skew propagates into Stage 2\l  · k too small → wide local sub-parts → large cross-exec overlap → HaloDrop reads amplify\l  · k too small → KLL boundary error (~1/k) can't distinguish target cuts\l  · k too large → sub-parts &lt; 50-100 MB → shuffle metadata overhead dominates\l  · practical range for h2o (10 GB): 64-160 sub-parts total (16-40 per exec)\l"];
+
+  //////////////////////// Edges ////////////////////////
+  E1 -> scheduler [style=dashed, color="#666666", label="bounds + counts"];
+  E2 -> scheduler [style=dashed, color="#666666"];
+  E3 -> scheduler [style=dashed, color="#666666"];
+  E4 -> scheduler [style=dashed, color="#666666"];
+
+  scheduler -> S1 [style=dashed, color="#666666", label="4 assignments\n(pull-list, g_i, halo)"];
+  scheduler -> S2 [style=dashed, color="#666666"];
+  scheduler -> S3 [style=dashed, color="#666666"];
+  scheduler -> S4 [style=dashed, color="#666666"];
+
+  E1 -> S1;  E1 -> S2;  E1 -> S3;  E1 -> S4;
+  E2 -> S1;  E2 -> S2;  E2 -> S3;  E2 -> S4;
+  E3 -> S1;  E3 -> S2;  E3 -> S3;  E3 -> S4;
+  E4 -> S1;  E4 -> S2;  E4 -> S3;  E4 -> S4;
+
+  S1 -> client [label="p0..p3"];
+  S2 -> client [label="p4..p7"];
+  S3 -> client [label="p8..p11"];
+  S4 -> client [label="p12..p15"];
+}
