@@ -58,22 +58,26 @@ pub mod ballista_physical_plan_node {
     }
 }
 /// Value-range router over unordered inputs for the parallel-window path.
-/// Currently a pass-through inserted above BWAG by the detection rule;
-/// upcoming commits grow it into the real router that consumes an upstream
-/// `RuntimeStatsExec`'s T-Digest via a child-tree walk. The child plan is
-/// plumbed by the framework as `inputs\[0\]` during decode. Sibling
-/// `OrderedRangeRepartitionExec` handles the sorted case and is not yet
-/// built.
+/// Splits `P` input partitions into `K = output_partitions` unsorted output
+/// partitions via half-open value ranges. Boundaries are *discovered at
+/// runtime* by walking the child subtree for a sibling `RuntimeStatsExec`
+/// and reading its T-Digest — the operator is stateless w.r.t. those cuts.
+/// The child plan is plumbed by the framework as `inputs\[0\]` during decode.
+/// Sibling `OrderedRangeRepartitionExec` handles the sorted case and is not
+/// yet built.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UnorderedRangeRepartitionExecNode {
     /// Lexicographic ORDER BY carried through from the wrapping window
-    /// operator. The eventual router reads only the first key for value
-    /// routing, but the full ordering is preserved so multi-key routing and
-    /// downstream operators that need the full ordering keep working.
+    /// operator. Routing keys off the first entry today; the full ordering is
+    /// preserved so downstream operators (SortExec, BWAG) that need it keep
+    /// working.
     #[prost(message, repeated, tag = "1")]
     pub order_by: ::prost::alloc::vec::Vec<
         ::datafusion_proto::protobuf::PhysicalSortExprNode,
     >,
+    /// K — number of output partitions. Must be ≥ 2.
+    #[prost(uint32, tag = "2")]
+    pub output_partitions: u32,
 }
 /// Runtime-stats tap for the parallel-window path. Passes batches through
 /// unmodified while accumulating:

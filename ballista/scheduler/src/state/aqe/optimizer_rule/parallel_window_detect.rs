@@ -46,8 +46,8 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{WindowFrameBound, WindowFrameUnits};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::windows::BoundedWindowAggExec;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use log::info;
 use std::sync::Arc;
 
@@ -82,10 +82,16 @@ impl PhysicalOptimizerRule for ParallelWindowDetectRule {
                     children.len()
                 );
             };
+            // K defaults to the input's partition count — inherit the parallelism
+            // level Ballista already spun up. Real production K comes from a
+            // cluster-shape config; that lands with the AQE Barrier 1.5 rule
+            // that also feeds the sketch-derived cuts.
+            let k = bwag_input.output_partitioning().partition_count().max(2);
             let wrapped: Arc<dyn ExecutionPlan> =
                 Arc::new(UnorderedRangeRepartitionExec::try_new(
                     (*bwag_input).clone(),
                     bwag.order_by.clone(),
+                    k,
                 )?);
             let new_bwag = node.with_new_children(vec![wrapped])?;
             // Jump past the rewritten node's children — the BWAG we just

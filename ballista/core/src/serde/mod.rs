@@ -568,6 +568,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 Ok(Arc::new(UnorderedRangeRepartitionExec::try_new(
                     input.clone(),
                     order_by,
+                    node.output_partitions as usize,
                 )?))
             }
             PhysicalPlanType::RuntimeStats(node) => {
@@ -778,7 +779,10 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
             )?;
             let proto = protobuf::BallistaPhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::UnorderedRangeRepartition(
-                    protobuf::UnorderedRangeRepartitionExecNode { order_by },
+                    protobuf::UnorderedRangeRepartitionExecNode {
+                        order_by,
+                        output_partitions: exec.output_partitions() as u32,
+                    },
                 )),
             };
             proto.encode(buf).map_err(|e| {
@@ -1351,6 +1355,7 @@ mod test {
         let original = UnorderedRangeRepartitionExec::try_new(
             input.clone(),
             vec![sort_expr.clone()],
+            8,
         )
         .unwrap();
 
@@ -1369,6 +1374,7 @@ mod test {
         assert_eq!(order_by[0].expr.to_string(), sort_expr.expr.to_string());
         assert!(!order_by[0].options.descending);
         assert!(order_by[0].options.nulls_first);
+        assert_eq!(decoded.output_partitions(), 8, "K must round-trip");
     }
 
     /// The API accepts multi-key lexicographic ordering (RANGE-frame windows
@@ -1402,7 +1408,7 @@ mod test {
             },
         ];
         let original =
-            UnorderedRangeRepartitionExec::try_new(input.clone(), order_by.clone())
+            UnorderedRangeRepartitionExec::try_new(input.clone(), order_by.clone(), 16)
                 .unwrap();
 
         let codec = BallistaPhysicalExtensionCodec::default();
@@ -1526,7 +1532,7 @@ mod test {
             false,
         )]));
         let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
-        let err = UnorderedRangeRepartitionExec::try_new(input, vec![])
+        let err = UnorderedRangeRepartitionExec::try_new(input, vec![], 4)
             .expect_err("empty ORDER BY must be rejected — no routing key to sample on");
         assert!(
             err.to_string().contains("at least one ORDER BY expression"),

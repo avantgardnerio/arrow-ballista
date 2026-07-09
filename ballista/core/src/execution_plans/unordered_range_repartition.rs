@@ -17,64 +17,141 @@
 
 //! Value-range router over unordered inputs. Reads `P` input partitions with
 //! no sort assumption, evaluates the first ORDER BY expression per row, and
-//! routes each row to one of `K` output partitions based on value-cut
-//! boundaries supplied by an upstream [`RuntimeStatsExec`]'s T-Digest.
+//! routes each row to one of `K` output partitions under the half-open
+//! convention: partition `p` owns `[cut[p-1], cut[p])` with virtual `-∞`/`+∞`
+//! sentinels on the ends.
 //!
-//! Passes batches through unchanged today; upcoming commits grow it into the
-//! real router (child-tree walk to `RuntimeStatsExec`, per-input scattering
-//! task, per-output stream). Sibling `OrderedRangeRepartitionExec` handles
-//! the sorted case (N sorted → M sorted range-disjoint via k-way merge) and
-//! is not yet built. See the design workspace at
+//! # Dynamic discovery
+//!
+//! The whole point of this operator is that boundaries are *discovered at
+//! runtime*, not baked in at plan time. On the first batch to arrive from
+//! any input partition, the operator walks its own child subtree to find a
+//! sibling [`RuntimeStatsExec`], snapshots its `merged_quantile_sketch()`,
+//! and computes `K - 1` quantile cuts at `1/K, 2/K, ..., (K-1)/K`. All
+//! batches (including the one that triggered the snapshot) then route
+//! through those cuts.
+//!
+//! # Fallback
+//!
+//! If no sibling [`RuntimeStatsExec`] exists, or it's in row-count-only mode
+//! (no sketch), or the sketch is empty, discovery returns an empty cut set
+//! and every row lands in output partition 0 — the natural single-bucket
+//! outcome of `boundaries.len() + 1 = 1`. Runtime routing must never crash;
+//! degraded-but-alive beats the alternative, and downstream sees an empty
+//! stream on the K-1 partitions that got no data.
+//!
+//! # Type generality
+//!
+//! The impl hardcodes Float64 downcast internally (that's what DataFusion's
+//! T-Digest speaks). The public API and the sibling [`RuntimeStatsExec`]
+//! stay type-agnostic; widening to other `Ord` `ScalarValue` types replaces
+//! the downcast + boundary computation, no API break.
+//!
+//! Sibling `OrderedRangeRepartitionExec` (not yet built) handles the sorted
+//! case (N sorted → M sorted range-disjoint via k-way merge). See
 //! `docs/source/contributors-guide/parallel-window-kll-adaptive.md`.
-//!
-//! The operator's `try_new` API accepts the full `Vec<PhysicalSortExpr>` from
-//! the wrapping window so multi-key `ORDER BY` and non-column expressions
-//! survive plan round-trips.
 //!
 //! [`RuntimeStatsExec`]: crate::execution_plans::RuntimeStatsExec
 
 use std::fmt::{self, Debug, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::{Result, internal_err};
+use datafusion::arrow::array::{Array, Float64Array, RecordBatch, UInt32Array};
+use datafusion::arrow::compute::take_arrays;
+use datafusion::arrow::datatypes::{DataType, SchemaRef};
+use datafusion::common::{Result, internal_datafusion_err, internal_err};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::PhysicalSortExpr;
+use datafusion::physical_expr::{
+    EquivalenceProperties, Partitioning, PhysicalExpr, PhysicalSortExpr,
+};
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
     SendableRecordBatchStream,
 };
+use futures::stream::StreamExt;
+use log::warn;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::execution_plans::{BufferExec, RuntimeStatsExec};
+
+/// Per-output-partition channel capacity. Small = tight backpressure; the
+/// classic double-buffering shape (one batch in-flight while consumer works
+/// on another). When a downstream drain lags, `send().await` suspends the
+/// scatter task, which suspends its input read, which propagates upstream.
+/// Bump if profiling shows scatter tasks blocked on `send` more than the
+/// downstream is meaningfully doing work.
+const CHANNEL_CAPACITY: usize = 2;
 
 /// Value-range router over unordered inputs. See the module-level docs.
 pub struct UnorderedRangeRepartitionExec {
     input: Arc<dyn ExecutionPlan>,
     /// Lexicographic ORDER BY carried through from the wrapping window
-    /// operator. `try_new` guarantees at least one element.
+    /// operator. `try_new` guarantees at least one element; the first entry
+    /// (a `Float64` column, until we widen) drives routing.
     order_by: Vec<PhysicalSortExpr>,
+    /// K — number of output partitions. K=1 collapses all P inputs to a
+    /// single bucket (the same shape discovery-failure fallback produces);
+    /// larger K spreads rows by value range.
+    output_partitions: usize,
+    /// Lazy channel setup guarded by `Mutex`. First `execute()` call spawns
+    /// the P input-reader tasks and creates the K channels; subsequent
+    /// `execute(p)` calls take `channels[p]`.
+    state: Arc<Mutex<DispatchState>>,
     properties: Arc<PlanProperties>,
 }
 
+/// Per-exec-instance lazy state. Owns the K receivers between setup and the
+/// K per-partition takes.
+struct DispatchState {
+    /// K slots. Each holds `Some(receiver)` after setup, `None` once its
+    /// output partition has been consumed.
+    receivers: Vec<Option<mpsc::Receiver<Result<RecordBatch>>>>,
+    initialized: bool,
+}
+
 impl UnorderedRangeRepartitionExec {
-    /// Wrap `input` in a value-range router. `order_by` must contain at
-    /// least one expression — nothing to route on otherwise.
+    /// Wrap `input`. `order_by` must be non-empty and its first entry must
+    /// evaluate to `Float64` against `input.schema()`. `output_partitions`
+    /// is K; any value works, K=1 gives a coalesce-shaped passthrough.
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
         order_by: Vec<PhysicalSortExpr>,
+        output_partitions: usize,
+        // TODO: support RANGE & ROW halos
     ) -> Result<Self> {
-        let [_first, ..] = order_by.as_slice() else {
+        let [routing, ..] = order_by.as_slice() else {
             return internal_err!(
                 "UnorderedRangeRepartitionExec requires at least one ORDER BY expression"
             );
         };
+        let schema = input.schema();
+        let routing_type = routing.expr.data_type(&schema)?;
+        if !matches!(routing_type, DataType::Float64) {
+            // TODO: support all continuous primitives
+            return internal_err!(
+                "UnorderedRangeRepartitionExec routing expression `{}` must be Float64, got {:?}",
+                routing.expr,
+                routing_type
+            );
+        }
         let properties = Arc::new(PlanProperties::new(
-            input.equivalence_properties().clone(),
-            input.output_partitioning().clone(),
+            EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(output_partitions),
             input.pipeline_behavior(),
             input.boundedness(),
         ));
+        let state = Arc::new(Mutex::new(DispatchState {
+            receivers: Vec::new(),
+            initialized: false,
+        }));
         Ok(Self {
             input,
             order_by,
+            output_partitions,
+            state,
             properties,
         })
     }
@@ -83,12 +160,18 @@ impl UnorderedRangeRepartitionExec {
     pub fn order_by(&self) -> &[PhysicalSortExpr] {
         &self.order_by
     }
+
+    /// K — the fixed output partition count.
+    pub fn output_partitions(&self) -> usize {
+        self.output_partitions
+    }
 }
 
 impl Debug for UnorderedRangeRepartitionExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("UnorderedRangeRepartitionExec")
             .field("order_by", &self.order_by)
+            .field("output_partitions", &self.output_partitions)
             .finish()
     }
 }
@@ -98,13 +181,14 @@ impl DisplayAs for UnorderedRangeRepartitionExec {
         let routing = &self.order_by[0];
         write!(
             f,
-            "UnorderedRangeRepartitionExec: routing={} {}",
+            "UnorderedRangeRepartitionExec: routing={} {} → {} partitions",
             routing.expr,
             if routing.options.descending {
                 "desc"
             } else {
                 "asc"
-            }
+            },
+            self.output_partitions,
         )
     }
 }
@@ -139,6 +223,7 @@ impl ExecutionPlan for UnorderedRangeRepartitionExec {
         Ok(Arc::new(UnorderedRangeRepartitionExec::try_new(
             input.clone(),
             self.order_by.clone(),
+            self.output_partitions,
         )?))
     }
 
@@ -147,6 +232,817 @@ impl ExecutionPlan for UnorderedRangeRepartitionExec {
         partition: usize,
         ctx: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        self.input.execute(partition, ctx)
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| internal_datafusion_err!("dispatch state mutex poisoned"))?;
+        if !state.initialized {
+            let mut senders = Vec::with_capacity(self.output_partitions);
+            let mut receivers = Vec::with_capacity(self.output_partitions);
+            for _ in 0..self.output_partitions {
+                let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+                senders.push(tx);
+                receivers.push(Some(rx));
+            }
+            state.receivers = receivers;
+            state.initialized = true;
+            let senders: Arc<[mpsc::Sender<Result<RecordBatch>>]> = senders.into();
+            // Empty `Vec<f64>` = discovery failed = single-bucket fallback.
+            // Populated once, on the first batch, by whichever scatter task
+            // wins the `OnceLock::get_or_init` race.
+            let cuts_cell: Arc<OnceLock<Vec<f64>>> = Arc::new(OnceLock::new());
+            let input_partitions = self.input.output_partitioning().partition_count();
+            let routing_expr = self.order_by[0].expr.clone(); // TODO: KLL for multi-column?
+            for input_partition in 0..input_partitions {
+                let child = self.input.clone();
+                let senders = senders.clone();
+                let cuts_cell = cuts_cell.clone();
+                let routing_expr = routing_expr.clone();
+                let ctx = ctx.clone();
+                let output_partitions = self.output_partitions;
+                tokio::spawn(async move {
+                    scatter_input_partition(
+                        child,
+                        input_partition,
+                        ctx,
+                        routing_expr,
+                        senders,
+                        cuts_cell,
+                        output_partitions,
+                    )
+                    .await;
+                });
+            }
+        }
+        let Some(slot) = state.receivers.get_mut(partition) else {
+            return internal_err!(
+                "UnorderedRangeRepartitionExec: partition {} out of range (have {})",
+                partition,
+                self.output_partitions
+            );
+        };
+        let receiver = slot.take().ok_or_else(|| {
+            internal_datafusion_err!(
+                "UnorderedRangeRepartitionExec: execute({partition}) called twice \
+                 on the same instance"
+            )
+        })?;
+        drop(state);
+        let stream = ReceiverStream::new(receiver);
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.schema(),
+            stream,
+        )))
+    }
+}
+
+/// One background task per input partition. Reads the child's batches; on
+/// the first batch, the shared `OnceLock` learns the value cuts (by walking
+/// the child tree for `RuntimeStatsExec` and snapshotting its sketch).
+/// Every batch — including the first — is then dispatched via
+/// `split_batch_by_range`, which handles the degenerate empty-cuts case
+/// (all rows to partition 0) transparently.
+async fn scatter_input_partition(
+    child: Arc<dyn ExecutionPlan>,
+    input_partition: usize,
+    ctx: Arc<TaskContext>,
+    routing_expr: Arc<dyn PhysicalExpr>,
+    senders: Arc<[mpsc::Sender<Result<RecordBatch>>]>,
+    cuts_cell: Arc<OnceLock<Vec<f64>>>,
+    output_partitions: usize,
+) {
+    let mut stream = match child.execute(input_partition, ctx) {
+        Ok(s) => s,
+        Err(err) => {
+            broadcast_error(&senders, err).await;
+            return;
+        }
+    };
+    while let Some(batch_result) = stream.next().await {
+        // Every downstream consumer dropped its receiver — DRR itself was
+        // dropped, or every output partition had a `LIMIT` above and hit it.
+        // Either way, no one's listening; stop reading input so this scatter
+        // task exits promptly (drops its `stream`, which propagates upstream).
+        if senders.iter().all(|s| s.is_closed()) {
+            return;
+        }
+        let batch = match batch_result {
+            Ok(b) => b,
+            Err(err) => {
+                broadcast_error(&senders, err).await;
+                return;
+            }
+        };
+        let cuts = cuts_cell.get_or_init(|| {
+            discover_cuts(&child, routing_expr.as_ref(), output_partitions)
+        });
+        match split_batch_by_range(&batch, &routing_expr, cuts) {
+            Ok(splits) => {
+                for (output, sub) in splits.into_iter().enumerate() {
+                    if sub.num_rows() == 0 {
+                        continue;
+                    }
+                    // `send().await` is where the backpressure lives:
+                    // suspends when the channel is at capacity, which
+                    // suspends this scatter task, which suspends its
+                    // input read → propagates upstream. Errors mean the
+                    // downstream dropped its receiver; keep forwarding
+                    // to the other outputs.
+                    let _ = senders[output].send(Ok(sub)).await;
+                }
+            }
+            Err(err) => {
+                broadcast_error(&senders, err).await;
+                return;
+            }
+        }
+    }
+    // All senders drop with this task → receivers see EOF.
+}
+
+/// Best-effort broadcast of a terminal error to every output partition.
+/// `DataFusionError` isn't `Clone`; serialize via `to_string` and re-wrap as
+/// `Internal` on replicas beyond the first.
+async fn broadcast_error(
+    senders: &Arc<[mpsc::Sender<Result<RecordBatch>>]>,
+    err: datafusion::error::DataFusionError,
+) {
+    let message = err.to_string();
+    let mut first = Some(err);
+    for sender in senders.iter() {
+        let payload = match first.take() {
+            Some(original) => Err(original),
+            None => Err(internal_datafusion_err!("{}", message)),
+        };
+        let _ = sender.send(payload).await;
+    }
+}
+
+/// Walk `child`'s subtree for a [`RuntimeStatsExec`] that sketches on our
+/// routing expression, snapshot its merged T-Digest, and compute `K - 1`
+/// quantile cuts. Any failure to find a matching sketch returns an empty
+/// `Vec` — the caller's `split_batch_by_range(&[])` produces a single
+/// bucket and every row lands in output partition 0. Never crashes.
+fn discover_cuts(
+    child: &Arc<dyn ExecutionPlan>,
+    routing_expr: &dyn PhysicalExpr,
+    output_partitions: usize,
+) -> Vec<f64> {
+    let Some(stats) = find_runtime_stats(child, routing_expr) else {
+        warn!(
+            "UnorderedRangeRepartitionExec: no matching RuntimeStatsExec found in child \
+             subtree — single-bucket fallback"
+        );
+        return Vec::new();
+    };
+    // Walker returned Some → stats.order_by()'s first entry matches our
+    // routing expression → RuntimeStatsExec's construction contract
+    // guarantees sketch is present. Belt-and-braces `else` in case that
+    // invariant ever drifts.
+    let Some(sketch) = stats.merged_quantile_sketch() else {
+        warn!(
+            "UnorderedRangeRepartitionExec: matching RuntimeStatsExec has no sketch \
+             (RuntimeStatsExec contract broken?) — single-bucket fallback"
+        );
+        return Vec::new();
+    };
+    // `count()` is the sum of centroid weights — total observed row count
+    // that fed the digest. Zero means no samples arrived before the
+    // snapshot; degenerate cuts would follow.
+    if sketch.count() == 0.0 {
+        warn!(
+            "UnorderedRangeRepartitionExec: matching sketch has no samples yet — \
+             single-bucket fallback"
+        );
+        return Vec::new();
+    }
+    // K-1 cuts at 1/K, 2/K, ..., (K-1)/K. `estimate_quantile` is monotone by
+    // construction, so cuts are non-decreasing (ties possible on hot-value
+    // distributions — `split_batch_by_range` handles those correctly, it
+    // just skews the resulting distribution).
+    let k = output_partitions as f64;
+    (1..output_partitions)
+        .map(|i| sketch.estimate_quantile(i as f64 / k))
+        .collect()
+}
+
+/// Walks `plan`'s subtree through single-child chains only, returning the
+/// first [`RuntimeStatsExec`] that sketches on `routing_expr`.
+///
+/// Two invariants have to hold for a sketch to be trustworthy:
+/// 1. **Expression match.** A sketch of column `foo` says nothing about
+///    routing on column `bar`. A `RuntimeStatsExec` sketching on a different
+///    expression is treated as a plain passthrough — the walker keeps
+///    descending past it looking for a matching one deeper in the chain.
+/// 2. **Distribution preservation.** Any operator between us and the stats
+///    that drops rows (`FilterExec`, `LimitExec`), transforms the routing
+///    value (`ProjectionExec` with a computed column), or duplicates rows
+///    (`JoinExec`) makes the sketch stale — the count still holds but the
+///    distribution has drifted. The walker consults [`preserves_distribution`]
+///    and refuses to descend past anything it doesn't know is safe.
+///
+/// Also stops at any branch (> 1 child) or leaf (0 children) — descending
+/// into a join's sides would risk picking up a sketch of the wrong subtree.
+fn find_runtime_stats<'a>(
+    plan: &'a Arc<dyn ExecutionPlan>,
+    routing_expr: &dyn PhysicalExpr,
+) -> Option<&'a RuntimeStatsExec> {
+    if let Some(stats) = plan.downcast_ref::<RuntimeStatsExec>() {
+        let matches = stats
+            .order_by()
+            .and_then(|order_by| order_by.first())
+            .is_some_and(|first| first.expr.as_ref() == routing_expr);
+        if matches {
+            return Some(stats);
+        }
+        // Non-matching stats is still a passthrough for our purposes — fall
+        // through to the descent step.
+    } else if !preserves_distribution(plan.as_ref()) {
+        // Unrecognized node type — could change the row set or value
+        // distribution of the routing key. Refuse to descend.
+        return None;
+    }
+    let children = plan.children();
+    let [only_child] = children.as_slice() else {
+        return None;
+    };
+    find_runtime_stats(only_child, routing_expr)
+}
+
+/// Whitelist of pass-through operator types the walker will descend through
+/// on its way to a matching [`RuntimeStatsExec`]. Unlisted operators might
+/// drop rows, duplicate rows, or transform the routing key's value — any of
+/// which would make an upstream sketch stale by the time data reaches us.
+///
+/// Being conservative is the safety net: unrecognized node → walker gives
+/// up → single-bucket fallback. Extending this list requires positive
+/// verification that the operator is a distribution-preserving passthrough
+/// for the routing key. Absent an upstream `ExecutionPlan::affects_distribution()`
+/// method (nice-to-have that isn't going to land), we maintain this by hand.
+fn preserves_distribution(plan: &dyn ExecutionPlan) -> bool {
+    // `SortExec` reorders but doesn't drop, duplicate, or transform values
+    // — distribution over the routing key is preserved (we're unordered, so
+    // sort order doesn't matter to us). Anticipated to sit between DRR and
+    // stats before this PR closes.
+    plan.downcast_ref::<BufferExec>().is_some()
+        || plan.downcast_ref::<SortExec>().is_some()
+}
+
+/// Split `batch` into `K = boundaries.len() + 1` sub-batches under the
+/// half-open convention: partition `p` receives rows where
+/// `boundaries[p-1] <= key < boundaries[p]` (open at `-∞` on partition 0
+/// and at `+∞` on partition K-1). Output vector is always length K; empty
+/// buckets produce empty `RecordBatch`es rather than being omitted, so
+/// callers can index by partition id.
+///
+/// NULL routing keys land in partition 0 today; a follow-up will honor
+/// `sort_options.nulls_first`/`nulls_last` to match SQL semantics.
+///
+/// Boundaries are pre-extracted `f64`s; widening to other routing key
+/// types generalizes this function and the discovery path together.
+pub(crate) fn split_batch_by_range(
+    batch: &RecordBatch,
+    routing_expr: &Arc<dyn PhysicalExpr>,
+    boundaries: &[f64],
+) -> Result<Vec<RecordBatch>> {
+    let output_partitions = boundaries.len() + 1;
+    let schema = batch.schema();
+    if batch.num_rows() == 0 {
+        return Ok((0..output_partitions)
+            .map(|_| RecordBatch::new_empty(schema.clone()))
+            .collect());
+    }
+    let evaluated = routing_expr.evaluate(batch)?;
+    let array = evaluated.into_array(batch.num_rows())?;
+    let keys = array.as_any().downcast_ref::<Float64Array>().ok_or_else(|| {
+        internal_datafusion_err!(
+            "UnorderedRangeRepartitionExec: routing expr produced {:?}, expected Float64",
+            array.data_type()
+        )
+    })?;
+
+    let mut buckets: Vec<Vec<u32>> = (0..output_partitions).map(|_| Vec::new()).collect();
+    for row in 0..batch.num_rows() {
+        let target = if keys.is_null(row) {
+            0
+        } else {
+            // partition_point returns the count of elements matching the
+            // predicate — here `<= key` — which is the target partition
+            // index under the half-open convention.
+            boundaries.partition_point(|&cut| cut <= keys.value(row))
+        };
+        buckets[target].push(row as u32);
+    }
+
+    let mut result = Vec::with_capacity(output_partitions);
+    for indices in buckets {
+        if indices.is_empty() {
+            result.push(RecordBatch::new_empty(schema.clone()));
+        } else {
+            let idx_array = UInt32Array::from(indices);
+            let taken = take_arrays(batch.columns(), &idx_array, None)?;
+            result.push(RecordBatch::try_new(schema.clone(), taken)?);
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{Float64Array, Int64Array};
+    use datafusion::arrow::datatypes::{Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::execution::SessionStateBuilder;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+    use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
+
+    fn f64_col(schema: &Schema, name: &str) -> Arc<dyn PhysicalExpr> {
+        col(name, schema).unwrap()
+    }
+
+    fn schema_v2_id() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("v2", DataType::Float64, true),
+            Field::new("id", DataType::Int64, false),
+        ]))
+    }
+
+    fn batch(schema: &Arc<Schema>, keys: Vec<Option<f64>>, ids: Vec<i64>) -> RecordBatch {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float64Array::from(keys)),
+                Arc::new(Int64Array::from(ids)),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn asc(schema: &Schema, name: &str) -> PhysicalSortExpr {
+        PhysicalSortExpr {
+            expr: col(name, schema).unwrap(),
+            options: Default::default(),
+        }
+    }
+
+    // ---------- split_batch_by_range: pure helper -----------------------
+
+    #[test]
+    fn split_conserves_rows_across_buckets() {
+        let schema = schema_v2_id();
+        let batch = batch(
+            &schema,
+            vec![
+                Some(-3.0),
+                Some(0.0),
+                Some(1.5),
+                Some(5.0),
+                Some(9.9),
+                Some(10.0),
+                Some(100.0),
+            ],
+            vec![0, 1, 2, 3, 4, 5, 6],
+        );
+        let routing = f64_col(&schema, "v2");
+        let splits = split_batch_by_range(&batch, &routing, &[0.0, 10.0]).unwrap();
+        assert_eq!(splits.len(), 3, "K = boundaries.len() + 1");
+        let total: usize = splits.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, batch.num_rows(), "no row lost or duplicated");
+    }
+
+    #[test]
+    fn split_half_open_boundary_lands_in_higher_partition() {
+        let schema = schema_v2_id();
+        // 0.0 lands in partition 1 (not 0); 10.0 lands in partition 2 (not 1).
+        let batch = batch(
+            &schema,
+            vec![Some(-0.1), Some(0.0), Some(9.999), Some(10.0)],
+            vec![0, 1, 2, 3],
+        );
+        let routing = f64_col(&schema, "v2");
+        let splits = split_batch_by_range(&batch, &routing, &[0.0, 10.0]).unwrap();
+        assert_eq!(splits[0].num_rows(), 1);
+        assert_eq!(splits[1].num_rows(), 2);
+        assert_eq!(splits[2].num_rows(), 1);
+    }
+
+    #[test]
+    fn split_routes_nulls_to_partition_zero() {
+        let schema = schema_v2_id();
+        let batch = batch(
+            &schema,
+            vec![None, Some(5.0), None, Some(50.0)],
+            vec![0, 1, 2, 3],
+        );
+        let routing = f64_col(&schema, "v2");
+        let splits = split_batch_by_range(&batch, &routing, &[10.0]).unwrap();
+        assert_eq!(splits[0].num_rows(), 3);
+        assert_eq!(splits[1].num_rows(), 1);
+    }
+
+    #[test]
+    fn split_empty_batch_produces_k_empty_batches() {
+        let schema = schema_v2_id();
+        let batch = batch(&schema, vec![], vec![]);
+        let routing = f64_col(&schema, "v2");
+        let splits = split_batch_by_range(&batch, &routing, &[0.0, 10.0]).unwrap();
+        assert_eq!(splits.len(), 3);
+        assert!(splits.iter().all(|b| b.num_rows() == 0));
+    }
+
+    // ---------- try_new: constructor validation -------------------------
+
+    fn empty_input(schema: &Arc<Schema>) -> Arc<dyn ExecutionPlan> {
+        MemorySourceConfig::try_new_exec(&[vec![]], schema.clone(), None).unwrap()
+    }
+
+    #[test]
+    fn try_new_rejects_empty_order_by() {
+        let schema = schema_v2_id();
+        let err = UnorderedRangeRepartitionExec::try_new(empty_input(&schema), vec![], 3)
+            .expect_err("empty order_by must be rejected");
+        assert!(
+            err.to_string().contains("at least one ORDER BY expression"),
+            "error should name the missing invariant, got: {err}"
+        );
+    }
+
+    #[test]
+    fn try_new_rejects_non_float64_routing_key() {
+        let schema = schema_v2_id();
+        let err = UnorderedRangeRepartitionExec::try_new(
+            empty_input(&schema),
+            vec![asc(&schema, "id")], // Int64
+            3,
+        )
+        .expect_err("Int64 routing key must be rejected");
+        assert!(
+            err.to_string().contains("must be Float64"),
+            "error should name the type mismatch, got: {err}"
+        );
+    }
+
+    #[test]
+    fn output_partitioning_reflects_k() {
+        let schema = schema_v2_id();
+        let exec = UnorderedRangeRepartitionExec::try_new(
+            empty_input(&schema),
+            vec![asc(&schema, "v2")],
+            4,
+        )
+        .unwrap();
+        assert_eq!(exec.properties().output_partitioning().partition_count(), 4);
+    }
+
+    // ---------- execute(): end-to-end routing over Scan → Stats → DRR --
+
+    fn mem_input(
+        schema: &Arc<Schema>,
+        partitions: Vec<Vec<(Option<f64>, i64)>>,
+    ) -> Arc<dyn ExecutionPlan> {
+        let batches: Vec<Vec<RecordBatch>> = partitions
+            .into_iter()
+            .map(|rows| {
+                let (keys, ids): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+                vec![batch(schema, keys, ids)]
+            })
+            .collect();
+        MemorySourceConfig::try_new_exec(&batches, schema.clone(), None).unwrap()
+    }
+
+    /// Wrap `source` in a `RuntimeStatsExec` (sketch mode on `v2`), then in
+    /// a DRR — matches the Stage-1 layout minus the Dam.
+    fn source_stats_drr(
+        schema: &Arc<Schema>,
+        source: Arc<dyn ExecutionPlan>,
+        k: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        let stats = Arc::new(
+            RuntimeStatsExec::try_new(source, Some(vec![asc(schema, "v2")])).unwrap(),
+        );
+        Arc::new(
+            UnorderedRangeRepartitionExec::try_new(stats, vec![asc(schema, "v2")], k)
+                .unwrap(),
+        )
+    }
+
+    /// Drain all K output partitions **concurrently** — otherwise the
+    /// bounded scatter channels can deadlock: while a test sequentially
+    /// polls partition 0, scatter tasks fill channels 1..K-1 to
+    /// `CHANNEL_CAPACITY` and block on send, never dropping their partition-0
+    /// senders. In production K downstream tasks run concurrently and this
+    /// pattern never arises.
+    async fn drain_concurrent<T: Send + 'static>(
+        exec: Arc<dyn ExecutionPlan>,
+        ctx: Arc<SessionContext>,
+        column: usize,
+        extract: fn(&RecordBatch, usize) -> Vec<T>,
+    ) -> Vec<Vec<T>> {
+        let output_partitions = exec.output_partitioning().partition_count();
+        let streams: Vec<_> = (0..output_partitions)
+            .map(|p| exec.execute(p, ctx.task_ctx()).unwrap())
+            .collect();
+        let handles: Vec<_> = streams
+            .into_iter()
+            .map(|stream| {
+                tokio::spawn(async move {
+                    let batches: Vec<RecordBatch> =
+                        <_ as futures::stream::StreamExt>::collect::<
+                            Vec<Result<RecordBatch>>,
+                        >(stream)
+                        .await
+                        .into_iter()
+                        .map(|r| r.unwrap())
+                        .collect();
+                    batches.iter().flat_map(|b| extract(b, column)).collect()
+                })
+            })
+            .collect();
+        let mut per_output = Vec::with_capacity(output_partitions);
+        for handle in handles {
+            per_output.push(handle.await.unwrap());
+        }
+        per_output
+    }
+
+    fn extract_ids(batch: &RecordBatch, column: usize) -> Vec<i64> {
+        batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect()
+    }
+
+    fn extract_keys(batch: &RecordBatch, column: usize) -> Vec<f64> {
+        batch
+            .column(column)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect()
+    }
+
+    async fn ids_per_output(
+        exec: Arc<dyn ExecutionPlan>,
+        ctx: Arc<SessionContext>,
+    ) -> Vec<Vec<i64>> {
+        drain_concurrent(exec, ctx, 1, extract_ids).await
+    }
+
+    async fn keys_per_output(
+        exec: Arc<dyn ExecutionPlan>,
+        ctx: Arc<SessionContext>,
+    ) -> Vec<Vec<f64>> {
+        drain_concurrent(exec, ctx, 0, extract_keys).await
+    }
+
+    fn session() -> Arc<SessionContext> {
+        Arc::new(SessionContext::new_with_state(
+            SessionStateBuilder::new().with_default_features().build(),
+        ))
+    }
+
+    /// Random-uniform-ish input over Scan → RuntimeStatsExec → DRR: verify
+    /// every row lands in *some* output, and no row lands in more than one.
+    #[tokio::test]
+    async fn end_to_end_conserves_rows() {
+        let schema = schema_v2_id();
+        // 20 rows, roughly evenly spread across [0, 100).
+        let rows: Vec<(Option<f64>, i64)> = (0..20)
+            .map(|i| (Some((i as f64) * 5.0), i as i64))
+            .collect();
+        let source = mem_input(&schema, vec![rows]);
+        let exec = source_stats_drr(&schema, source, 4);
+        let per_output = ids_per_output(exec, session()).await;
+        let total: usize = per_output.iter().map(|v| v.len()).sum();
+        assert_eq!(total, 20, "every row must land in exactly one output");
+    }
+
+    /// The load-bearing property: outputs are range-disjoint. For every
+    /// adjacent pair `(p, p+1)`, `max(partition[p]) <= min(partition[p+1])`.
+    #[tokio::test]
+    async fn end_to_end_partitions_are_range_disjoint() {
+        let schema = schema_v2_id();
+        let rows: Vec<(Option<f64>, i64)> = (0..40)
+            .map(|i| (Some((i as f64) * 2.5), i as i64))
+            .collect();
+        let source = mem_input(&schema, vec![rows]);
+        let exec = source_stats_drr(&schema, source, 4);
+        let keys = keys_per_output(exec, session()).await;
+        for window in keys.windows(2) {
+            let [left, right] = window else {
+                unreachable!()
+            };
+            if left.is_empty() || right.is_empty() {
+                continue;
+            }
+            let left_max = left.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let right_min = right.iter().cloned().fold(f64::INFINITY, f64::min);
+            assert!(
+                left_max <= right_min,
+                "range-disjoint invariant broken: max(left)={left_max} > min(right)={right_min}"
+            );
+        }
+    }
+
+    /// Multiple input partitions still route correctly. Distinct values in
+    /// each input partition; conservation must hold across all of them.
+    #[tokio::test]
+    async fn end_to_end_multiple_input_partitions() {
+        let schema = schema_v2_id();
+        let partitions = vec![
+            (0..10).map(|i| (Some(i as f64), i as i64)).collect(),
+            (0..10)
+                .map(|i| (Some(i as f64 + 20.0), 100 + i as i64))
+                .collect(),
+            (0..10)
+                .map(|i| (Some(i as f64 + 50.0), 200 + i as i64))
+                .collect(),
+        ];
+        let source = mem_input(&schema, partitions);
+        let exec = source_stats_drr(&schema, source, 4);
+        let per_output = ids_per_output(exec, session()).await;
+        let total: usize = per_output.iter().map(|v| v.len()).sum();
+        assert_eq!(total, 30);
+    }
+
+    /// Fallback: without a sibling `RuntimeStatsExec`, every batch funnels
+    /// to `FALLBACK_PARTITION`. No crash, no error, no data loss.
+    #[tokio::test]
+    async fn end_to_end_fallback_when_no_runtime_stats() {
+        let schema = schema_v2_id();
+        let rows: Vec<(Option<f64>, i64)> =
+            (0..15).map(|i| (Some(i as f64), i as i64)).collect();
+        let source = mem_input(&schema, vec![rows]);
+        // No RuntimeStatsExec in the tree — DRR built directly on the source.
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(
+            UnorderedRangeRepartitionExec::try_new(source, vec![asc(&schema, "v2")], 4)
+                .unwrap(),
+        );
+        let per_output = ids_per_output(exec, session()).await;
+        assert_eq!(per_output.len(), 4);
+        // Empty cuts → single-bucket fallback → everything on partition 0.
+        assert_eq!(per_output[0].len(), 15);
+        assert_eq!(per_output[1].len(), 0);
+        assert_eq!(per_output[2].len(), 0);
+        assert_eq!(per_output[3].len(), 0);
+    }
+
+    /// Fallback also fires when the sibling `RuntimeStatsExec` is in
+    /// row-count-only mode (no sketch to read cuts from).
+    #[tokio::test]
+    async fn end_to_end_fallback_when_stats_has_no_sketch() {
+        let schema = schema_v2_id();
+        let rows: Vec<(Option<f64>, i64)> =
+            (0..12).map(|i| (Some(i as f64), i as i64)).collect();
+        let source = mem_input(&schema, vec![rows]);
+        let stats = Arc::new(RuntimeStatsExec::try_new(source, None).unwrap()); // row-count only
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(
+            UnorderedRangeRepartitionExec::try_new(stats, vec![asc(&schema, "v2")], 3)
+                .unwrap(),
+        );
+        let per_output = ids_per_output(exec, session()).await;
+        assert_eq!(per_output.len(), 3);
+        assert_eq!(per_output[0].len(), 12);
+        assert_eq!(per_output[1].len(), 0);
+        assert_eq!(per_output[2].len(), 0);
+    }
+
+    /// A `RuntimeStatsExec` hiding behind a branching node (here `UnionExec`
+    /// with two children) is *not* what we want — its sketch reflects only
+    /// one side of the branch, not the data actually flowing through DRR.
+    /// Discovery must refuse to descend and fall back cleanly.
+    #[tokio::test]
+    async fn end_to_end_fallback_when_runtime_stats_hides_behind_branch() {
+        use datafusion::physical_plan::union::UnionExec;
+        let schema = schema_v2_id();
+        // Branch A: has a RuntimeStatsExec sketching v2, values in [0, 5).
+        let branch_a = mem_input(
+            &schema,
+            vec![(0..5).map(|i| (Some(i as f64), i as i64)).collect()],
+        );
+        let stats_on_branch_a = Arc::new(
+            RuntimeStatsExec::try_new(branch_a, Some(vec![asc(&schema, "v2")])).unwrap(),
+        );
+        // Branch B: no stats; values shifted to [100, 105) so a "wrong"
+        // sketch (only branch A) would send them all to the top partition.
+        let branch_b = mem_input(
+            &schema,
+            vec![
+                (0..5)
+                    .map(|i| (Some(100.0 + i as f64), 100 + i as i64))
+                    .collect(),
+            ],
+        );
+        let union: Arc<dyn ExecutionPlan> =
+            UnionExec::try_new(vec![stats_on_branch_a, branch_b]).unwrap();
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(
+            UnorderedRangeRepartitionExec::try_new(union, vec![asc(&schema, "v2")], 3)
+                .unwrap(),
+        );
+        let per_output = ids_per_output(exec, session()).await;
+        // Empty cuts → single-bucket fallback → all on partition 0. If
+        // find_runtime_stats had descended into the union, branch A's tiny
+        // sketch would have spread rows across partitions instead.
+        assert_eq!(per_output.len(), 3);
+        assert_eq!(per_output[0].len(), 10);
+        assert_eq!(per_output[1].len(), 0);
+        assert_eq!(per_output[2].len(), 0);
+    }
+
+    /// `BufferExec` is on the distribution-preserving whitelist: the walker
+    /// must traverse it to reach the matching `RuntimeStatsExec`, and cuts
+    /// come out non-empty (data lands across multiple output partitions,
+    /// not funneled to bucket 0).
+    #[tokio::test]
+    async fn end_to_end_walker_descends_through_buffer() {
+        use crate::execution_plans::{BufferExec, BufferMode};
+        let schema = schema_v2_id();
+        let rows: Vec<(Option<f64>, i64)> =
+            (0..40).map(|i| (Some(i as f64), i as i64)).collect();
+        let source = mem_input(&schema, vec![rows]);
+        let stats = Arc::new(
+            RuntimeStatsExec::try_new(source, Some(vec![asc(&schema, "v2")])).unwrap(),
+        );
+        let buffer = Arc::new(BufferExec::try_new(stats, BufferMode::Dam).unwrap());
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(
+            UnorderedRangeRepartitionExec::try_new(buffer, vec![asc(&schema, "v2")], 4)
+                .unwrap(),
+        );
+        let per_output = ids_per_output(exec, session()).await;
+        let non_empty = per_output.iter().filter(|v| !v.is_empty()).count();
+        assert!(
+            non_empty > 1,
+            "walker should have traversed BufferExec, populated cuts, and \
+             spread rows across multiple outputs — got per_output={per_output:?}"
+        );
+    }
+
+    /// `FilterExec` is *not* on the whitelist: it drops rows, so any upstream
+    /// sketch has stale distribution info. The walker must refuse to descend
+    /// through it → single-bucket fallback (all rows to partition 0).
+    #[tokio::test]
+    async fn end_to_end_walker_refuses_filter() {
+        use datafusion::physical_expr::expressions::{Literal, binary};
+        use datafusion::physical_plan::filter::FilterExec;
+        use datafusion::scalar::ScalarValue;
+        let schema = schema_v2_id();
+        let rows: Vec<(Option<f64>, i64)> =
+            (0..15).map(|i| (Some(i as f64), i as i64)).collect();
+        let source = mem_input(&schema, vec![rows]);
+        let stats = Arc::new(
+            RuntimeStatsExec::try_new(source, Some(vec![asc(&schema, "v2")])).unwrap(),
+        );
+        // `v2 >= 0` — passes every row (we just want a FilterExec node in the
+        // chain so the walker has to decide whether to descend past it).
+        let predicate = binary(
+            col("v2", schema.as_ref()).unwrap(),
+            datafusion::logical_expr::Operator::GtEq,
+            Arc::new(Literal::new(ScalarValue::Float64(Some(0.0)))),
+            schema.as_ref(),
+        )
+        .unwrap();
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, stats).unwrap());
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(
+            UnorderedRangeRepartitionExec::try_new(filter, vec![asc(&schema, "v2")], 4)
+                .unwrap(),
+        );
+        let per_output = ids_per_output(exec, session()).await;
+        // Every row funnels to bucket 0 — walker refused to descend past
+        // FilterExec, so cuts came back empty.
+        assert_eq!(per_output.len(), 4);
+        assert_eq!(per_output[0].len(), 15);
+        assert_eq!(per_output[1].len(), 0);
+        assert_eq!(per_output[2].len(), 0);
+        assert_eq!(per_output[3].len(), 0);
+    }
+
+    /// First execute(p) takes channels[p]; second call must error rather than
+    /// silently returning nothing. Uses the concurrent-drain helper because
+    /// bounded scatter channels would deadlock under sequential collection.
+    #[tokio::test]
+    async fn execute_same_partition_twice_errors() {
+        let schema = schema_v2_id();
+        let source = mem_input(&schema, vec![vec![(Some(5.0), 0)]]);
+        let exec = source_stats_drr(&schema, source, 3);
+        let ctx = session();
+        let _ = ids_per_output(exec.clone(), ctx.clone()).await;
+        let err = match exec.execute(0, ctx.task_ctx()) {
+            Ok(_) => panic!("second execute on same partition must error"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("execute(0) called twice"),
+            "error should name the invariant, got: {err}"
+        );
     }
 }
