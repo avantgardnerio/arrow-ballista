@@ -53,6 +53,7 @@ message BallistaPhysicalPlanNode {
     ChaosExecNode chaos_exec = 5;
     UnorderedRangeRepartitionExecNode unordered_range_repartition = 6;
     RuntimeStatsExecNode runtime_stats = 7;
+    OrderedRangeRepartitionExecNode ordered_range_repartition = 8;
   }
 }
 
@@ -69,6 +70,22 @@ message UnorderedRangeRepartitionExecNode {
   // operator. Routing keys off the first entry today; the full ordering is
   // preserved so downstream operators (SortExec, BWAG) that need it keep
   // working.
+  repeated datafusion.PhysicalSortExprNode order_by = 1;
+  // K — number of output partitions. Must be ≥ 2.
+  uint32 output_partitions = 2;
+}
+
+// Value-range router over N locally-sorted overlapping input partitions.
+// Redistributes them into K range-disjoint output partitions where each
+// output is fully sorted on the routing expression. Uses N × K scatter
+// channels feeding K per-output k-way merges (via DataFusion's SPM
+// internals). Discovery of cut boundaries is identical to the unordered
+// variant — walk the child subtree for a matching `RuntimeStatsExec`, snap
+// its T-Digest.
+message OrderedRangeRepartitionExecNode {
+  // Lexicographic ORDER BY. Routing keys off the first entry; the full
+  // ordering is preserved for downstream operators. Must match the
+  // input's declared `output_ordering` at plan time.
   repeated datafusion.PhysicalSortExprNode order_by = 1;
   // K — number of output partitions. Must be ≥ 2.
   uint32 output_partitions = 2;
