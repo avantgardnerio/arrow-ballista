@@ -22,6 +22,7 @@ mod buffer;
 mod chaos_exec;
 mod distributed_explain_analyze;
 mod distributed_query;
+mod range_repartition_common;
 mod runtime_stats;
 mod shuffle_reader;
 mod shuffle_writer;
