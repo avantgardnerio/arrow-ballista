@@ -822,6 +822,7 @@ impl RunningStage {
                         task_status::Status::Successful(SuccessfulTask {
                             executor_id,
                             partitions: _,
+                            ..
                         }),
                     ..
                 }) if *executor == *executor_id => {
@@ -1145,6 +1146,7 @@ mod tests {
             status: Some(task_status::Status::Successful(SuccessfulTask {
                 executor_id: "executor-1".to_string(),
                 partitions: vec![],
+                runtime_stats: vec![],
             })),
             metrics: vec![],
         }

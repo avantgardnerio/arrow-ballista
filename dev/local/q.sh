@@ -26,7 +26,7 @@ if [ ! -x "$H2O_BIN" ] || [ "${REPO_ROOT}/benchmarks/src/bin/h2o.rs" -nt "$H2O_B
     (cd "$REPO_ROOT" && cargo build --bin h2o -p ballista-benchmarks)
 fi
 
-exec timeout 120 "$H2O_BIN" ballista \
+exec timeout "${Q_TIMEOUT:-120}" "$H2O_BIN" ballista \
     --host 127.0.0.1 --port 50050 \
     --queries-path "$QUERIES" \
     --path unused \

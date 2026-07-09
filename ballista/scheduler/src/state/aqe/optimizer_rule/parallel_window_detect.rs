@@ -39,7 +39,9 @@
 //!     DataFusion's built-in T-Digest is `f64`-only. Widening waits on a
 //!     DIY generic-over-`Ord` KLL sketch we intend to build later.
 
-use ballista_core::execution_plans::UnorderedRangeRepartitionExec;
+use ballista_core::execution_plans::{
+    BufferExec, BufferMode, RuntimeStatsExec, UnorderedRangeRepartitionExec,
+};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -87,13 +89,36 @@ impl PhysicalOptimizerRule for ParallelWindowDetectRule {
             // cluster-shape config; that lands with the AQE Barrier 1.5 rule
             // that also feeds the sketch-derived cuts.
             let k = bwag_input.output_partitioning().partition_count().max(2);
-            let wrapped: Arc<dyn ExecutionPlan> =
-                Arc::new(UnorderedRangeRepartitionExec::try_new(
+            // Build the Stage-1 chain from bottom up:
+            //   1. Pre-DRR RuntimeStatsExec (sketch mode) — feeds DRR's local
+            //      cut discovery via `discover_cuts`.
+            //   2. BufferExec in Dam mode — accumulates the sketch's sample
+            //      before DRR reads it. Without the dam DRR would snapshot on
+            //      the first batch when the sketch has barely started.
+            //   3. UnorderedRangeRepartitionExec — routes into K sub-partitions
+            //      based on local cuts.
+            //   4. Post-DRR RuntimeStatsExec (sketch mode) — the one visible
+            //      to the executor's report walker, since the whitelist
+            //      excludes DRR itself. This is what feeds the scheduler at
+            //      Stage 1 completion.
+            let stats_pre: Arc<dyn ExecutionPlan> = Arc::new(
+                RuntimeStatsExec::try_new(
                     (*bwag_input).clone(),
+                    Some(bwag.order_by.clone()),
+                )?,
+            );
+            let dam: Arc<dyn ExecutionPlan> =
+                Arc::new(BufferExec::try_new(stats_pre, BufferMode::Dam)?);
+            let drr: Arc<dyn ExecutionPlan> =
+                Arc::new(UnorderedRangeRepartitionExec::try_new(
+                    dam,
                     bwag.order_by.clone(),
                     k,
                 )?);
-            let new_bwag = node.with_new_children(vec![wrapped])?;
+            let stats_post: Arc<dyn ExecutionPlan> = Arc::new(
+                RuntimeStatsExec::try_new(drr, Some(bwag.order_by.clone()))?,
+            );
+            let new_bwag = node.with_new_children(vec![stats_post])?;
             // Jump past the rewritten node's children — the BWAG we just
             // reconstructed still matches `as_candidate` by shape, and
             // recursing would re-wrap forever.
@@ -367,10 +392,11 @@ mod tests {
         count
     }
 
-    // Positional check: the wrap lands directly under BWAG, not somewhere
-    // else in the tree.
+    // Positional check: the whole Stage-1 chain lands directly under BWAG,
+    // top-down as `RuntimeStatsExec (post-DRR) → DRR → BufferExec (Dam) →
+    // RuntimeStatsExec (pre-DRR) → original input`.
     #[tokio::test]
-    async fn wraps_land_directly_under_bwag() -> datafusion::common::Result<()> {
+    async fn chain_shape_under_bwag() -> datafusion::common::Result<()> {
         use datafusion::physical_plan::windows::BoundedWindowAggExec;
 
         let plan = plan(
@@ -380,26 +406,43 @@ mod tests {
         )
         .await?;
         let rewritten = ParallelWindowDetectRule.optimize(plan, &ConfigOptions::new())?;
-        let mut found = false;
+        let mut checked_bwag = false;
         rewritten.apply(|node| {
-            if node.downcast_ref::<BoundedWindowAggExec>().is_some() {
-                let children = node.children();
-                let [bwag_input] = children.as_slice() else {
-                    unreachable!("BWAG has exactly one child")
-                };
-                if bwag_input
-                    .downcast_ref::<UnorderedRangeRepartitionExec>()
-                    .is_some()
-                {
-                    found = true;
-                }
-            }
+            let Some(_bwag) = node.downcast_ref::<BoundedWindowAggExec>() else {
+                return Ok(TreeNodeRecursion::Continue);
+            };
+            let children = node.children();
+            let [post_drr_stats] = children.as_slice() else {
+                unreachable!("BWAG has exactly one child")
+            };
+            let post_stats = post_drr_stats
+                .downcast_ref::<RuntimeStatsExec>()
+                .expect("BWAG's direct child must be post-DRR RuntimeStatsExec");
+            let post_children = post_stats.children();
+            let [drr_node] = post_children.as_slice() else {
+                unreachable!("RuntimeStatsExec has one child")
+            };
+            let drr = drr_node
+                .downcast_ref::<UnorderedRangeRepartitionExec>()
+                .expect("post-DRR stats' child must be UnorderedRangeRepartitionExec");
+            let drr_children = drr.children();
+            let [dam_node] = drr_children.as_slice() else {
+                unreachable!("DRR has one child")
+            };
+            let dam = dam_node
+                .downcast_ref::<BufferExec>()
+                .expect("DRR's child must be BufferExec (Dam)");
+            let dam_children = dam.children();
+            let [pre_drr_stats_node] = dam_children.as_slice() else {
+                unreachable!("BufferExec has one child")
+            };
+            pre_drr_stats_node
+                .downcast_ref::<RuntimeStatsExec>()
+                .expect("BufferExec's child must be pre-DRR RuntimeStatsExec");
+            checked_bwag = true;
             Ok(TreeNodeRecursion::Continue)
         })?;
-        assert!(
-            found,
-            "BWAG's direct child must be UnorderedRangeRepartitionExec"
-        );
+        assert!(checked_bwag, "test should have found at least one BWAG");
         Ok(())
     }
 }

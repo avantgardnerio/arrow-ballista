@@ -147,6 +147,14 @@ impl RuntimeStatsExec {
         Ok(counter.load(Ordering::Relaxed))
     }
 
+    /// Number of partition slots this operator was built with (matches its
+    /// input's declared partition count). Every slot has its own row counter
+    /// and — in sketch mode — its own sketch; a given task only fills the
+    /// slot(s) it actually executes.
+    pub fn partition_count(&self) -> usize {
+        self.row_counts.len()
+    }
+
     /// Rows observed across all partitions so far.
     pub fn total_row_count(&self) -> usize {
         self.row_counts
@@ -409,6 +417,92 @@ impl Drop for StreamState {
             }
         }
     }
+}
+
+/// Walk `plan` and collect one [`RuntimeStatsReport`] per
+/// [`RuntimeStatsExec`] that remains valid at the plan's output. "Valid"
+/// means reachable through single-child chains of distribution-preserving
+/// operators only — see [`super::range_repartition_common::preserves_distribution`].
+/// A stats-tap sitting *below* a `DRR` (or any distribution-changing
+/// operator) is excluded automatically because the walker stops at that
+/// boundary; its sketch describes data the DRR then routed away, no
+/// longer meaningful at the plan's output.
+///
+/// Executors call this once per task at completion to package what to
+/// return to the scheduler.
+pub fn collect_reports(
+    plan: &Arc<dyn ExecutionPlan>,
+) -> Result<Vec<crate::serde::protobuf::RuntimeStatsReport>> {
+    use datafusion_proto::physical_plan::{
+        DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
+    };
+    let codec = DefaultPhysicalExtensionCodec {};
+    let converter = DefaultPhysicalProtoConverter {};
+    let mut found: Vec<&RuntimeStatsExec> = Vec::new();
+    collect_reachable_stats(plan, &mut found);
+    found
+        .into_iter()
+        .map(|stats| stats_to_report(stats, &codec, &converter))
+        .collect()
+}
+
+/// DFS `plan` through single-child chains only, descending through
+/// distribution-preserving nodes and past non-matching `RuntimeStatsExec`s.
+/// Stops at any branch, leaf, or non-whitelisted node. Same shape as
+/// [`super::range_repartition_common::find_runtime_stats`] but collects
+/// *all* reachable stats rather than returning the first match.
+fn collect_reachable_stats<'a>(
+    plan: &'a Arc<dyn ExecutionPlan>,
+    out: &mut Vec<&'a RuntimeStatsExec>,
+) {
+    if let Some(stats) = plan.downcast_ref::<RuntimeStatsExec>() {
+        out.push(stats);
+        // Continue descending — a plan could conceivably chain multiple
+        // stats-taps; `preserves_distribution` still guards the recursion.
+    } else if !super::range_repartition_common::preserves_distribution(plan.as_ref()) {
+        return;
+    }
+    let children = plan.children();
+    let [only_child] = children.as_slice() else {
+        return;
+    };
+    collect_reachable_stats(only_child, out);
+}
+
+fn stats_to_report(
+    stats: &RuntimeStatsExec,
+    codec: &dyn datafusion_proto::physical_plan::PhysicalExtensionCodec,
+    converter: &datafusion_proto::physical_plan::DefaultPhysicalProtoConverter,
+) -> Result<crate::serde::protobuf::RuntimeStatsReport> {
+    use datafusion_proto::physical_plan::to_proto::serialize_physical_sort_exprs;
+    let order_by = match stats.order_by() {
+        Some(order_by) => {
+            serialize_physical_sort_exprs(order_by.iter().cloned(), codec, converter)?
+        }
+        None => Vec::new(),
+    };
+    // Iterate every partition slot the operator holds. Slots the task
+    // didn't touch have row_count = 0 and an empty sketch; we still emit
+    // them so the scheduler sees a shape-consistent view. Filter on the
+    // scheduler side if space matters.
+    let partition_count = stats.partition_count();
+    let mut partitions = Vec::with_capacity(partition_count);
+    for partition_id in 0..partition_count {
+        let row_count = stats.row_count(partition_id)? as u64;
+        let sketch = match stats.quantile_sketch(partition_id)? {
+            Some(sk) if sk.count() > 0.0 => Some(sketch_to_proto(&sk)?),
+            _ => None,
+        };
+        partitions.push(crate::serde::protobuf::RuntimeStatsPartitionEntry {
+            partition_id: partition_id as u32,
+            row_count,
+            sketch,
+        });
+    }
+    Ok(crate::serde::protobuf::RuntimeStatsReport {
+        order_by,
+        partitions,
+    })
 }
 
 /// Serialize a T-Digest to the on-wire [`crate::serde::protobuf::QuantileSketchState`].

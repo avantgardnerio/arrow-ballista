@@ -55,6 +55,7 @@ message BallistaPhysicalPlanNode {
     RuntimeStatsExecNode runtime_stats = 7;
     OrderedRangeRepartitionExecNode ordered_range_repartition = 8;
     HaloDropExecNode halo_drop = 9;
+    BufferExecNode buffer = 10;
   }
 }
 
@@ -105,6 +106,20 @@ message RuntimeStatsExecNode {
   // sketch and the rest are preserved for downstream operators
   // (SortExec, BWAG) that need the full ordering.
   repeated datafusion.PhysicalSortExprNode order_by = 1;
+}
+
+// Flow-control operator with an operator-mode enum. The child plan is
+// plumbed by the framework as `inputs[0]` during decode.
+message BufferExecNode {
+  BufferMode mode = 1;
+}
+
+enum BufferMode {
+  // Buffers input while a MemoryReservation grows against the runtime's
+  // MemoryPool; the dam breaks when `try_grow` refuses further allocation.
+  BUFFER_MODE_DAM = 0;
+  // Future modes: PASS_THROUGH, BUFFER_ALL, SPILL_ON_PRESSURE, etc.
+  // Add here as they land in Rust.
 }
 
 // Drops halo rows after a window computation, keeping only rows whose

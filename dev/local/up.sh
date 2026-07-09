@@ -60,7 +60,7 @@ wait_port() {
 }
 
 echo "→ starting scheduler on 127.0.0.1:50050..."
-RUST_LOG=info "$SCHEDULER_BIN" \
+RUST_LOG="${RUST_LOG:-info}" "$SCHEDULER_BIN" \
     --bind-host 127.0.0.1 --external-host 127.0.0.1 --bind-port 50050 \
     > "${LOG_DIR}/scheduler.log" 2>&1 &
 echo $! >> "$PID_FILE"
@@ -70,12 +70,12 @@ for i in 0 1; do
     port=$((50051 + i))
     grpc=$((50151 + i))
     echo "→ starting executor $i on 127.0.0.1:${port}..."
-    RUST_LOG=ballista=info "$EXECUTOR_BIN" \
+    RUST_LOG="${RUST_LOG:-ballista=info}" "$EXECUTOR_BIN" \
         --scheduler-host 127.0.0.1 --scheduler-port 50050 \
         --bind-host 127.0.0.1 --external-host 127.0.0.1 \
         --bind-port "$port" --bind-grpc-port "$grpc" \
         --work-dir "${WORK_DIR}/exec${i}" \
-        --concurrent-tasks 4 --memory-pool-size 2GB \
+        --concurrent-tasks 4 --memory-pool-size "${MEMORY_POOL_SIZE:-16GB}" \
         > "${LOG_DIR}/exec${i}.log" 2>&1 &
     echo $! >> "$PID_FILE"
     wait_port "$port"

@@ -59,8 +59,8 @@ use log::info;
 
 use crate::shutdown::Shutdown;
 use ballista_core::serde::protobuf::{
-    FailedTask, OperatorMetricsSet, ShuffleWritePartition, SuccessfulTask, TaskStatus,
-    task_status,
+    FailedTask, OperatorMetricsSet, RuntimeStatsReport, ShuffleWritePartition,
+    SuccessfulTask, TaskStatus, task_status,
 };
 use ballista_core::serde::scheduler::PartitionId;
 use ballista_core::utils::GrpcServerConfig;
@@ -99,6 +99,7 @@ pub struct TaskExecutionTimes {
 /// This function wraps the outcome of task execution (success or failure)
 /// along with timing and metrics information into a status message that
 /// can be sent back to the scheduler.
+#[allow(clippy::too_many_arguments)]
 pub fn as_task_status(
     execution_result: ballista_core::error::Result<Vec<ShuffleWritePartition>>,
     executor_id: String,
@@ -106,15 +107,18 @@ pub fn as_task_status(
     stage_attempt_num: usize,
     partition_id: PartitionId,
     operator_metrics: Option<Vec<OperatorMetricsSet>>,
+    runtime_stats: Vec<RuntimeStatsReport>,
     execution_times: TaskExecutionTimes,
 ) -> TaskStatus {
     let metrics = operator_metrics.unwrap_or_default();
     match execution_result {
         Ok(partitions) => {
             debug!(
-                "Task {:?} finished with operator_metrics array size {}",
+                "Task {:?} finished with operator_metrics array size {} \
+                 and {} runtime-stats report(s)",
                 task_id,
-                metrics.len()
+                metrics.len(),
+                runtime_stats.len(),
             );
             TaskStatus {
                 task_id: task_id as u32,
@@ -129,6 +133,7 @@ pub fn as_task_status(
                 status: Some(task_status::Status::Successful(SuccessfulTask {
                     executor_id,
                     partitions,
+                    runtime_stats,
                 })),
             }
         }
