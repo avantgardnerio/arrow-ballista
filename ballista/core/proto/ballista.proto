@@ -51,21 +51,23 @@ message BallistaPhysicalPlanNode {
     UnresolvedShuffleExecNode unresolved_shuffle = 3;
     SortShuffleWriterExecNode sort_shuffle_writer = 4;
     ChaosExecNode chaos_exec = 5;
-    DynamicRangeRepartitionExecNode dynamic_range_repartition = 6;
+    UnorderedRangeRepartitionExecNode unordered_range_repartition = 6;
     RuntimeStatsExecNode runtime_stats = 7;
   }
 }
 
-// Range-partition marker for the parallel-window path. Currently a
-// pass-through inserted above BWAG by the detection rule; upcoming commits
-// grow it into a value-range router that consumes an upstream
-// `QuantileSketchExec`'s sketch via a child-tree walk. The child plan is
-// plumbed by the framework as `inputs[0]` during decode.
-message DynamicRangeRepartitionExecNode {
+// Value-range router over unordered inputs for the parallel-window path.
+// Currently a pass-through inserted above BWAG by the detection rule;
+// upcoming commits grow it into the real router that consumes an upstream
+// `RuntimeStatsExec`'s T-Digest via a child-tree walk. The child plan is
+// plumbed by the framework as `inputs[0]` during decode. Sibling
+// `OrderedRangeRepartitionExec` handles the sorted case and is not yet
+// built.
+message UnorderedRangeRepartitionExecNode {
   // Lexicographic ORDER BY carried through from the wrapping window
   // operator. The eventual router reads only the first key for value
-  // routing, but the full ordering is preserved so ROWS-frame (rank-based)
-  // routing can be added later without a schema break.
+  // routing, but the full ordering is preserved so multi-key routing and
+  // downstream operators that need the full ordering keep working.
   repeated datafusion.PhysicalSortExprNode order_by = 1;
 }
 

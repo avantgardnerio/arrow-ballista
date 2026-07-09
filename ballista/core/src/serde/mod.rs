@@ -58,8 +58,8 @@ use std::{convert::TryInto, io::Cursor};
 
 use crate::execution_plans::sort_shuffle::SortShuffleConfig;
 use crate::execution_plans::{
-    ChaosExec, CoalescePlan, DynamicRangeRepartitionExec, PartitionGroup,
-    RuntimeStatsExec, ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec,
+    ChaosExec, CoalescePlan, PartitionGroup, RuntimeStatsExec, ShuffleReaderExec,
+    ShuffleWriterExec, SortShuffleWriterExec, UnorderedRangeRepartitionExec,
     UnresolvedShuffleExec,
 };
 use crate::serde::protobuf::{
@@ -552,10 +552,10 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     Some(chaos_exec.seed),
                 )?))
             }
-            PhysicalPlanType::DynamicRangeRepartition(node) => {
+            PhysicalPlanType::UnorderedRangeRepartition(node) => {
                 let [input] = inputs else {
                     return Err(DataFusionError::Internal(format!(
-                        "DynamicRangeRepartitionExec expects exactly 1 input, got {}",
+                        "UnorderedRangeRepartitionExec expects exactly 1 input, got {}",
                         inputs.len()
                     )));
                 };
@@ -565,7 +565,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     input.schema().as_ref(),
                     &converter,
                 )?;
-                Ok(Arc::new(DynamicRangeRepartitionExec::try_new(
+                Ok(Arc::new(UnorderedRangeRepartitionExec::try_new(
                     input.clone(),
                     order_by,
                 )?))
@@ -769,7 +769,7 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 ))
             })?;
             Ok(())
-        } else if let Some(exec) = node.downcast_ref::<DynamicRangeRepartitionExec>() {
+        } else if let Some(exec) = node.downcast_ref::<UnorderedRangeRepartitionExec>() {
             let converter = DefaultPhysicalProtoConverter {};
             let order_by = serialize_physical_sort_exprs(
                 exec.order_by().iter().cloned(),
@@ -777,13 +777,13 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 &converter,
             )?;
             let proto = protobuf::BallistaPhysicalPlanNode {
-                physical_plan_type: Some(PhysicalPlanType::DynamicRangeRepartition(
-                    protobuf::DynamicRangeRepartitionExecNode { order_by },
+                physical_plan_type: Some(PhysicalPlanType::UnorderedRangeRepartition(
+                    protobuf::UnorderedRangeRepartitionExecNode { order_by },
                 )),
             };
             proto.encode(buf).map_err(|e| {
                 DataFusionError::Internal(format!(
-                    "failed to encode DynamicRangeRepartitionExec: {e:?}"
+                    "failed to encode UnorderedRangeRepartitionExec: {e:?}"
                 ))
             })?;
             Ok(())
@@ -1331,7 +1331,7 @@ mod test {
     /// sampler knows which column to route on. Round-trip a single-key
     /// ordering to guard the codec's happy path.
     #[tokio::test]
-    async fn test_dynamic_range_repartition_exec_roundtrip_single_key() {
+    async fn test_unordered_range_repartition_exec_roundtrip_single_key() {
         use datafusion::arrow::compute::SortOptions;
         use datafusion::physical_expr::PhysicalSortExpr;
         use datafusion::physical_plan::empty::EmptyExec;
@@ -1348,9 +1348,11 @@ mod test {
                 nulls_first: true,
             },
         };
-        let original =
-            DynamicRangeRepartitionExec::try_new(input.clone(), vec![sort_expr.clone()])
-                .unwrap();
+        let original = UnorderedRangeRepartitionExec::try_new(
+            input.clone(),
+            vec![sort_expr.clone()],
+        )
+        .unwrap();
 
         let codec = BallistaPhysicalExtensionCodec::default();
         let mut buf: Vec<u8> = vec![];
@@ -1360,8 +1362,8 @@ mod test {
         let decoded_plan = codec.try_decode(&buf, &[input], &ctx).unwrap();
 
         let decoded = decoded_plan
-            .downcast_ref::<DynamicRangeRepartitionExec>()
-            .expect("Expected DynamicRangeRepartitionExec");
+            .downcast_ref::<UnorderedRangeRepartitionExec>()
+            .expect("Expected UnorderedRangeRepartitionExec");
         let order_by = decoded.order_by();
         assert_eq!(order_by.len(), 1, "single-key ORDER BY should round-trip");
         assert_eq!(order_by[0].expr.to_string(), sort_expr.expr.to_string());
@@ -1373,7 +1375,7 @@ mod test {
     /// only route on the first key, but the wire format must not drop the
     /// rest — that's the ROWS-frame follow-up's substrate).
     #[tokio::test]
-    async fn test_dynamic_range_repartition_exec_roundtrip_multi_key() {
+    async fn test_unordered_range_repartition_exec_roundtrip_multi_key() {
         use datafusion::arrow::compute::SortOptions;
         use datafusion::physical_expr::PhysicalSortExpr;
         use datafusion::physical_plan::empty::EmptyExec;
@@ -1400,7 +1402,7 @@ mod test {
             },
         ];
         let original =
-            DynamicRangeRepartitionExec::try_new(input.clone(), order_by.clone())
+            UnorderedRangeRepartitionExec::try_new(input.clone(), order_by.clone())
                 .unwrap();
 
         let codec = BallistaPhysicalExtensionCodec::default();
@@ -1411,8 +1413,8 @@ mod test {
         let decoded_plan = codec.try_decode(&buf, &[input], &ctx).unwrap();
 
         let decoded = decoded_plan
-            .downcast_ref::<DynamicRangeRepartitionExec>()
-            .expect("Expected DynamicRangeRepartitionExec");
+            .downcast_ref::<UnorderedRangeRepartitionExec>()
+            .expect("Expected UnorderedRangeRepartitionExec");
         let decoded_order_by = decoded.order_by();
         assert_eq!(decoded_order_by.len(), 2, "multi-key ORDER BY must survive");
         assert!(
@@ -1516,7 +1518,7 @@ mod test {
     /// `try_new` refuses an empty ORDER BY — no routing key means the
     /// downstream sampler has nothing to sample.
     #[test]
-    fn test_dynamic_range_repartition_exec_rejects_empty_order_by() {
+    fn test_unordered_range_repartition_exec_rejects_empty_order_by() {
         use datafusion::physical_plan::empty::EmptyExec;
         let schema = Arc::new(Schema::new(vec![Field::new(
             "v2",
@@ -1524,7 +1526,7 @@ mod test {
             false,
         )]));
         let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
-        let err = DynamicRangeRepartitionExec::try_new(input, vec![])
+        let err = UnorderedRangeRepartitionExec::try_new(input, vec![])
             .expect_err("empty ORDER BY must be rejected — no routing key to sample on");
         assert!(
             err.to_string().contains("at least one ORDER BY expression"),

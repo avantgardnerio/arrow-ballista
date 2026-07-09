@@ -16,7 +16,7 @@
 // under the License.
 
 //! Rule that wraps every parallelizable window's input in a
-//! `DynamicRangeRepartitionExec` marker. The marker is a pass-through today;
+//! `UnorderedRangeRepartitionExec` marker. The marker is a pass-through today;
 //! upcoming commits grow it into a T-Digest sampler + value-range router.
 //!
 //! The pitch is completion-under-memory-pressure via range partitioning.
@@ -39,7 +39,7 @@
 //!     DataFusion's built-in T-Digest is `f64`-only. Widening waits on a
 //!     DIY generic-over-`Ord` KLL sketch we intend to build later.
 
-use ballista_core::execution_plans::DynamicRangeRepartitionExec;
+use ballista_core::execution_plans::UnorderedRangeRepartitionExec;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -52,7 +52,7 @@ use log::info;
 use std::sync::Arc;
 
 /// Physical optimizer pass that wraps every parallelizable window's input
-/// in a `DynamicRangeRepartitionExec` marker. That operator is a pass-through
+/// in a `UnorderedRangeRepartitionExec` marker. That operator is a pass-through
 /// today; upcoming commits grow it into a T-Digest sampler + value-range
 /// router. Inserting the pass-through first lets us prove the rewrite lands
 /// in the right plan slot before touching execution semantics.
@@ -83,7 +83,7 @@ impl PhysicalOptimizerRule for ParallelWindowDetectRule {
                 );
             };
             let wrapped: Arc<dyn ExecutionPlan> =
-                Arc::new(DynamicRangeRepartitionExec::try_new(
+                Arc::new(UnorderedRangeRepartitionExec::try_new(
                     (*bwag_input).clone(),
                     bwag.order_by.clone(),
                 )?);
@@ -106,7 +106,7 @@ impl PhysicalOptimizerRule for ParallelWindowDetectRule {
 }
 
 /// Fields extracted from a matching `BoundedWindowAggExec` — everything the
-/// rewrite will eventually need to plant a `DynamicRangeRepartitionExec`.
+/// rewrite will eventually need to plant a `UnorderedRangeRepartitionExec`.
 /// Carries the full lexicographic ORDER BY (not just the routing key name)
 /// so the wrapping operator can accept it verbatim; today the sampler only
 /// uses the first entry, but the API is shape-general.
@@ -163,10 +163,13 @@ fn as_candidate(node: &dyn ExecutionPlan) -> Option<BwagCandidate> {
 }
 
 /// True when `plan` or any of its descendants is a
-/// `DynamicRangeRepartitionExec`. Cheap in-process walk; the plan tree is
+/// `UnorderedRangeRepartitionExec`. Cheap in-process walk; the plan tree is
 /// small compared to the data volume it describes.
 fn subtree_has_marker(plan: &dyn ExecutionPlan) -> bool {
-    if plan.downcast_ref::<DynamicRangeRepartitionExec>().is_some() {
+    if plan
+        .downcast_ref::<UnorderedRangeRepartitionExec>()
+        .is_some()
+    {
         return true;
     }
     plan.children()
@@ -200,7 +203,7 @@ fn fmt_bound(bound: &WindowFrameBound) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ballista_core::execution_plans::DynamicRangeRepartitionExec;
+    use ballista_core::execution_plans::UnorderedRangeRepartitionExec;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::datasource::empty::EmptyTable;
     use datafusion::prelude::SessionContext;
@@ -219,14 +222,17 @@ mod tests {
     }
 
     /// Runs the rule on `sql` and returns the number of
-    /// `DynamicRangeRepartitionExec` nodes it inserted. `1` means the target
+    /// `UnorderedRangeRepartitionExec` nodes it inserted. `1` means the target
     /// shape matched and got wrapped; `0` means the rule left the plan alone.
     async fn count_wraps(sql: &str) -> datafusion::common::Result<usize> {
         let plan = plan(sql).await?;
         let rewritten = ParallelWindowDetectRule.optimize(plan, &ConfigOptions::new())?;
         let mut wraps = 0;
         rewritten.apply(|node| {
-            if node.downcast_ref::<DynamicRangeRepartitionExec>().is_some() {
+            if node
+                .downcast_ref::<UnorderedRangeRepartitionExec>()
+                .is_some()
+            {
                 wraps += 1;
             }
             Ok(TreeNodeRecursion::Continue)
@@ -343,7 +349,10 @@ mod tests {
     fn count_markers(plan: &Arc<dyn ExecutionPlan>) -> usize {
         let mut count = 0;
         plan.apply(|node| {
-            if node.downcast_ref::<DynamicRangeRepartitionExec>().is_some() {
+            if node
+                .downcast_ref::<UnorderedRangeRepartitionExec>()
+                .is_some()
+            {
                 count += 1;
             }
             Ok(TreeNodeRecursion::Continue)
@@ -373,7 +382,7 @@ mod tests {
                     unreachable!("BWAG has exactly one child")
                 };
                 if bwag_input
-                    .downcast_ref::<DynamicRangeRepartitionExec>()
+                    .downcast_ref::<UnorderedRangeRepartitionExec>()
                     .is_some()
                 {
                     found = true;
@@ -383,7 +392,7 @@ mod tests {
         })?;
         assert!(
             found,
-            "BWAG's direct child must be DynamicRangeRepartitionExec"
+            "BWAG's direct child must be UnorderedRangeRepartitionExec"
         );
         Ok(())
     }

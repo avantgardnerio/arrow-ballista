@@ -52,22 +52,24 @@ pub mod ballista_physical_plan_node {
         #[prost(message, tag = "5")]
         ChaosExec(super::ChaosExecNode),
         #[prost(message, tag = "6")]
-        DynamicRangeRepartition(super::DynamicRangeRepartitionExecNode),
+        UnorderedRangeRepartition(super::UnorderedRangeRepartitionExecNode),
         #[prost(message, tag = "7")]
         RuntimeStats(super::RuntimeStatsExecNode),
     }
 }
-/// Range-partition marker for the parallel-window path. Currently a
-/// pass-through inserted above BWAG by the detection rule; upcoming commits
-/// grow it into a value-range router that consumes an upstream
-/// `QuantileSketchExec`'s sketch via a child-tree walk. The child plan is
-/// plumbed by the framework as `inputs\[0\]` during decode.
+/// Value-range router over unordered inputs for the parallel-window path.
+/// Currently a pass-through inserted above BWAG by the detection rule;
+/// upcoming commits grow it into the real router that consumes an upstream
+/// `RuntimeStatsExec`'s T-Digest via a child-tree walk. The child plan is
+/// plumbed by the framework as `inputs\[0\]` during decode. Sibling
+/// `OrderedRangeRepartitionExec` handles the sorted case and is not yet
+/// built.
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DynamicRangeRepartitionExecNode {
+pub struct UnorderedRangeRepartitionExecNode {
     /// Lexicographic ORDER BY carried through from the wrapping window
     /// operator. The eventual router reads only the first key for value
-    /// routing, but the full ordering is preserved so ROWS-frame (rank-based)
-    /// routing can be added later without a schema break.
+    /// routing, but the full ordering is preserved so multi-key routing and
+    /// downstream operators that need the full ordering keep working.
     #[prost(message, repeated, tag = "1")]
     pub order_by: ::prost::alloc::vec::Vec<
         ::datafusion_proto::protobuf::PhysicalSortExprNode,

@@ -15,16 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Range-partition marker for the parallel-window path. Passes batches
-//! through unchanged today; upcoming commits grow it into a value-range
-//! router that consumes a `T-Digest` from an upstream
-//! [`SamplerExec`](crate::execution_plans::SamplerExec) via a child-tree
-//! walk (see the design doc under
-//! `docs/source/contributors-guide/parallel-window-kll-adaptive.md`).
+//! Value-range router over unordered inputs. Reads `P` input partitions with
+//! no sort assumption, evaluates the first ORDER BY expression per row, and
+//! routes each row to one of `K` output partitions based on value-cut
+//! boundaries supplied by an upstream [`RuntimeStatsExec`]'s T-Digest.
 //!
-//! The operator's `try_new` API accepts the full `Vec<PhysicalSortExpr>`
-//! from the wrapping window so multi-key `ORDER BY` and non-column
-//! expressions survive plan round-trips.
+//! Passes batches through unchanged today; upcoming commits grow it into the
+//! real router (child-tree walk to `RuntimeStatsExec`, per-input scattering
+//! task, per-output stream). Sibling `OrderedRangeRepartitionExec` handles
+//! the sorted case (N sorted → M sorted range-disjoint via k-way merge) and
+//! is not yet built. See the design workspace at
+//! `docs/source/contributors-guide/parallel-window-kll-adaptive.md`.
+//!
+//! The operator's `try_new` API accepts the full `Vec<PhysicalSortExpr>` from
+//! the wrapping window so multi-key `ORDER BY` and non-column expressions
+//! survive plan round-trips.
+//!
+//! [`RuntimeStatsExec`]: crate::execution_plans::RuntimeStatsExec
 
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
@@ -38,8 +45,8 @@ use datafusion::physical_plan::{
     SendableRecordBatchStream,
 };
 
-/// Range-partition marker. See the module-level docs.
-pub struct DynamicRangeRepartitionExec {
+/// Value-range router over unordered inputs. See the module-level docs.
+pub struct UnorderedRangeRepartitionExec {
     input: Arc<dyn ExecutionPlan>,
     /// Lexicographic ORDER BY carried through from the wrapping window
     /// operator. `try_new` guarantees at least one element.
@@ -47,8 +54,8 @@ pub struct DynamicRangeRepartitionExec {
     properties: Arc<PlanProperties>,
 }
 
-impl DynamicRangeRepartitionExec {
-    /// Wrap `input` in a range-partition marker. `order_by` must contain at
+impl UnorderedRangeRepartitionExec {
+    /// Wrap `input` in a value-range router. `order_by` must contain at
     /// least one expression — nothing to route on otherwise.
     pub fn try_new(
         input: Arc<dyn ExecutionPlan>,
@@ -56,7 +63,7 @@ impl DynamicRangeRepartitionExec {
     ) -> Result<Self> {
         let [_first, ..] = order_by.as_slice() else {
             return internal_err!(
-                "DynamicRangeRepartitionExec requires at least one ORDER BY expression"
+                "UnorderedRangeRepartitionExec requires at least one ORDER BY expression"
             );
         };
         let properties = Arc::new(PlanProperties::new(
@@ -78,20 +85,20 @@ impl DynamicRangeRepartitionExec {
     }
 }
 
-impl Debug for DynamicRangeRepartitionExec {
+impl Debug for UnorderedRangeRepartitionExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DynamicRangeRepartitionExec")
+        f.debug_struct("UnorderedRangeRepartitionExec")
             .field("order_by", &self.order_by)
             .finish()
     }
 }
 
-impl DisplayAs for DynamicRangeRepartitionExec {
+impl DisplayAs for UnorderedRangeRepartitionExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter<'_>) -> fmt::Result {
         let routing = &self.order_by[0];
         write!(
             f,
-            "DynamicRangeRepartitionExec: routing={} {}",
+            "UnorderedRangeRepartitionExec: routing={} {}",
             routing.expr,
             if routing.options.descending {
                 "desc"
@@ -102,9 +109,9 @@ impl DisplayAs for DynamicRangeRepartitionExec {
     }
 }
 
-impl ExecutionPlan for DynamicRangeRepartitionExec {
+impl ExecutionPlan for UnorderedRangeRepartitionExec {
     fn name(&self) -> &str {
-        "DynamicRangeRepartitionExec"
+        "UnorderedRangeRepartitionExec"
     }
 
     fn schema(&self) -> SchemaRef {
@@ -125,11 +132,11 @@ impl ExecutionPlan for DynamicRangeRepartitionExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let [input] = children.as_slice() else {
             return internal_err!(
-                "DynamicRangeRepartitionExec expects exactly one child, got {}",
+                "UnorderedRangeRepartitionExec expects exactly one child, got {}",
                 children.len()
             );
         };
-        Ok(Arc::new(DynamicRangeRepartitionExec::try_new(
+        Ok(Arc::new(UnorderedRangeRepartitionExec::try_new(
             input.clone(),
             self.order_by.clone(),
         )?))
