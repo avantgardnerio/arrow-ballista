@@ -31,7 +31,7 @@ pub struct LogicalPlanCacheNode {
 pub struct BallistaPhysicalPlanNode {
     #[prost(
         oneof = "ballista_physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9"
     )]
     pub physical_plan_type: ::core::option::Option<
         ballista_physical_plan_node::PhysicalPlanType,
@@ -57,6 +57,8 @@ pub mod ballista_physical_plan_node {
         RuntimeStats(super::RuntimeStatsExecNode),
         #[prost(message, tag = "8")]
         OrderedRangeRepartition(super::OrderedRangeRepartitionExecNode),
+        #[prost(message, tag = "9")]
+        HaloDrop(super::HaloDropExecNode),
     }
 }
 /// Value-range router over unordered inputs for the parallel-window path.
@@ -119,6 +121,27 @@ pub struct RuntimeStatsExecNode {
     pub order_by: ::prost::alloc::vec::Vec<
         ::datafusion_proto::protobuf::PhysicalSortExprNode,
     >,
+}
+/// Drops halo rows after a window computation, keeping only rows whose
+/// routing key falls in the task's primary value range `[lo, hi_exclusive)`.
+/// Deliberately custom (not a `FilterExec` wrapper) so DataFusion's
+/// `PushDownFilter` optimizer rule can't move the predicate down through
+/// SPM/BWAG and silently drop halo rows before window frames are computed.
+/// TODO: add rank-based keep range for ROWS-frame windows.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HaloDropExecNode {
+    /// Expression whose value drives the keep/drop decision. Must evaluate
+    /// to the same DataType as `lo` and `hi_exclusive` (both Float64 today).
+    #[prost(message, optional, tag = "1")]
+    pub routing_expr: ::core::option::Option<
+        ::datafusion_proto::protobuf::PhysicalExprNode,
+    >,
+    /// Inclusive lower bound.
+    #[prost(message, optional, tag = "2")]
+    pub lo: ::core::option::Option<::datafusion_proto_common::ScalarValue>,
+    /// Exclusive upper bound. Must be strictly greater than `lo`.
+    #[prost(message, optional, tag = "3")]
+    pub hi_exclusive: ::core::option::Option<::datafusion_proto_common::ScalarValue>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChaosExecNode {

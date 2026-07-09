@@ -54,6 +54,7 @@ message BallistaPhysicalPlanNode {
     UnorderedRangeRepartitionExecNode unordered_range_repartition = 6;
     RuntimeStatsExecNode runtime_stats = 7;
     OrderedRangeRepartitionExecNode ordered_range_repartition = 8;
+    HaloDropExecNode halo_drop = 9;
   }
 }
 
@@ -104,6 +105,22 @@ message RuntimeStatsExecNode {
   // sketch and the rest are preserved for downstream operators
   // (SortExec, BWAG) that need the full ordering.
   repeated datafusion.PhysicalSortExprNode order_by = 1;
+}
+
+// Drops halo rows after a window computation, keeping only rows whose
+// routing key falls in the task's primary value range `[lo, hi_exclusive)`.
+// Deliberately custom (not a `FilterExec` wrapper) so DataFusion's
+// `PushDownFilter` optimizer rule can't move the predicate down through
+// SPM/BWAG and silently drop halo rows before window frames are computed.
+// TODO: add rank-based keep range for ROWS-frame windows.
+message HaloDropExecNode {
+  // Expression whose value drives the keep/drop decision. Must evaluate
+  // to the same DataType as `lo` and `hi_exclusive` (both Float64 today).
+  datafusion.PhysicalExprNode routing_expr = 1;
+  // Inclusive lower bound.
+  datafusion_common.ScalarValue lo = 2;
+  // Exclusive upper bound. Must be strictly greater than `lo`.
+  datafusion_common.ScalarValue hi_exclusive = 3;
 }
 
 message ChaosExecNode {

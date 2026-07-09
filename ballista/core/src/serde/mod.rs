@@ -32,11 +32,11 @@ use datafusion_proto::logical_plan::file_formats::{
     JsonLogicalExtensionCodec, ParquetLogicalExtensionCodec,
 };
 use datafusion_proto::physical_plan::from_proto::{
-    parse_physical_sort_exprs, parse_protobuf_hash_partitioning,
+    parse_physical_expr, parse_physical_sort_exprs, parse_protobuf_hash_partitioning,
     parse_protobuf_partitioning,
 };
 use datafusion_proto::physical_plan::to_proto::{
-    serialize_partitioning, serialize_physical_sort_exprs,
+    serialize_partitioning, serialize_physical_expr, serialize_physical_sort_exprs,
 };
 use datafusion_proto::physical_plan::{
     DefaultPhysicalExtensionCodec, DefaultPhysicalProtoConverter,
@@ -58,9 +58,9 @@ use std::{convert::TryInto, io::Cursor};
 
 use crate::execution_plans::sort_shuffle::SortShuffleConfig;
 use crate::execution_plans::{
-    ChaosExec, CoalescePlan, OrderedRangeRepartitionExec, PartitionGroup,
-    RuntimeStatsExec, ShuffleReaderExec, ShuffleWriterExec, SortShuffleWriterExec,
-    UnorderedRangeRepartitionExec, UnresolvedShuffleExec,
+    ChaosExec, CoalescePlan, HaloDropExec, KeepRange, OrderedRangeRepartitionExec,
+    PartitionGroup, RuntimeStatsExec, ShuffleReaderExec, ShuffleWriterExec,
+    SortShuffleWriterExec, UnorderedRangeRepartitionExec, UnresolvedShuffleExec,
 };
 use crate::serde::protobuf::{
     ballista_logical_plan_node::LogicalPlanType,
@@ -590,6 +590,40 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                     node.output_partitions as usize,
                 )?))
             }
+            PhysicalPlanType::HaloDrop(node) => {
+                let [input] = inputs else {
+                    return Err(DataFusionError::Internal(format!(
+                        "HaloDropExec expects exactly 1 input, got {}",
+                        inputs.len()
+                    )));
+                };
+                let routing_expr_node = node.routing_expr.as_ref().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "HaloDropExec missing routing_expr".to_string(),
+                    )
+                })?;
+                let routing_expr = parse_physical_expr(
+                    routing_expr_node,
+                    ctx,
+                    input.schema().as_ref(),
+                    self.default_codec.as_ref(),
+                )?;
+                let lo_proto = node.lo.as_ref().ok_or_else(|| {
+                    DataFusionError::Internal("HaloDropExec missing lo bound".to_string())
+                })?;
+                let hi_proto = node.hi_exclusive.as_ref().ok_or_else(|| {
+                    DataFusionError::Internal(
+                        "HaloDropExec missing hi_exclusive bound".to_string(),
+                    )
+                })?;
+                let lo = datafusion::common::ScalarValue::try_from(lo_proto)?;
+                let hi_exclusive = datafusion::common::ScalarValue::try_from(hi_proto)?;
+                Ok(Arc::new(HaloDropExec::try_new(
+                    input.clone(),
+                    routing_expr,
+                    KeepRange::Value { lo, hi_exclusive },
+                )?))
+            }
             PhysicalPlanType::RuntimeStats(node) => {
                 let [input] = inputs else {
                     return Err(DataFusionError::Internal(format!(
@@ -808,6 +842,37 @@ impl PhysicalExtensionCodec for BallistaPhysicalExtensionCodec {
                 DataFusionError::Internal(format!(
                     "failed to encode UnorderedRangeRepartitionExec: {e:?}"
                 ))
+            })?;
+            Ok(())
+        } else if let Some(exec) = node.downcast_ref::<HaloDropExec>() {
+            let routing_expr = serialize_physical_expr(
+                exec.routing_expr(),
+                self.default_codec.as_ref(),
+            )?;
+            let KeepRange::Value { lo, hi_exclusive } = exec.keep();
+            let lo_proto =
+                datafusion_proto_common::ScalarValue::try_from(lo).map_err(|e| {
+                    DataFusionError::Internal(format!(
+                        "failed to encode HaloDropExec lo: {e:?}"
+                    ))
+                })?;
+            let hi_proto = datafusion_proto_common::ScalarValue::try_from(hi_exclusive)
+                .map_err(|e| {
+                DataFusionError::Internal(format!(
+                    "failed to encode HaloDropExec hi_exclusive: {e:?}"
+                ))
+            })?;
+            let proto = protobuf::BallistaPhysicalPlanNode {
+                physical_plan_type: Some(PhysicalPlanType::HaloDrop(
+                    protobuf::HaloDropExecNode {
+                        routing_expr: Some(routing_expr),
+                        lo: Some(lo_proto),
+                        hi_exclusive: Some(hi_proto),
+                    },
+                )),
+            };
+            proto.encode(buf).map_err(|e| {
+                DataFusionError::Internal(format!("failed to encode HaloDropExec: {e:?}"))
             })?;
             Ok(())
         } else if let Some(exec) = node.downcast_ref::<OrderedRangeRepartitionExec>() {
@@ -1516,6 +1581,41 @@ mod test {
         assert_eq!(order_by.len(), 1, "ORDER BY must round-trip");
         assert_eq!(order_by[0].expr.to_string(), sort_expr.expr.to_string());
         assert_eq!(decoded.output_partitions(), 8, "K must round-trip");
+    }
+
+    /// `HaloDropExec` round-trips its routing expression and both bounds.
+    #[tokio::test]
+    async fn test_halo_drop_exec_roundtrip() {
+        use datafusion::physical_plan::empty::EmptyExec;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v2", DataType::Float64, false),
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let input: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema.clone()));
+        let routing_expr = col("v2", schema.as_ref()).unwrap();
+        let keep = KeepRange::Value {
+            lo: datafusion::common::ScalarValue::Float64(Some(10.0)),
+            hi_exclusive: datafusion::common::ScalarValue::Float64(Some(20.0)),
+        };
+        let original = HaloDropExec::try_new(input.clone(), routing_expr, keep).unwrap();
+
+        let codec = BallistaPhysicalExtensionCodec::default();
+        let mut buf: Vec<u8> = vec![];
+        codec.try_encode(Arc::new(original), &mut buf).unwrap();
+
+        let ctx = SessionContext::new().task_ctx();
+        let decoded_plan = codec.try_decode(&buf, &[input], &ctx).unwrap();
+
+        let decoded = decoded_plan
+            .downcast_ref::<HaloDropExec>()
+            .expect("Expected HaloDropExec");
+        assert_eq!(decoded.routing_expr().to_string(), "v2@0");
+        let KeepRange::Value { lo, hi_exclusive } = decoded.keep();
+        assert_eq!(lo, &datafusion::common::ScalarValue::Float64(Some(10.0)));
+        assert_eq!(
+            hi_exclusive,
+            &datafusion::common::ScalarValue::Float64(Some(20.0))
+        );
     }
 
     /// `RuntimeStatsExec` in sketching mode round-trips its ORDER BY and
