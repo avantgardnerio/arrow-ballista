@@ -410,3 +410,116 @@ impl Drop for StreamState {
         }
     }
 }
+
+/// Serialize a T-Digest to the on-wire [`crate::serde::protobuf::QuantileSketchState`].
+///
+/// Wraps `TDigest::to_scalar_state()` — the 6-element canonical form
+/// `(max_size, sum, count, max, min, centroids_as_list)` — each element
+/// encoded via `datafusion_proto_common::ScalarValue::try_from`.
+pub fn sketch_to_proto(
+    sketch: &datafusion_functions_aggregate_common::tdigest::TDigest,
+) -> Result<crate::serde::protobuf::QuantileSketchState> {
+    let state = sketch.to_scalar_state();
+    let proto_state = state
+        .iter()
+        .map(datafusion_proto_common::ScalarValue::try_from)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| {
+            internal_datafusion_err!("failed to encode TDigest to proto: {e:?}")
+        })?;
+    Ok(crate::serde::protobuf::QuantileSketchState { state: proto_state })
+}
+
+/// Deserialize a [`crate::serde::protobuf::QuantileSketchState`] into a T-Digest.
+///
+/// Reverses [`sketch_to_proto`]. Guards against corrupted wire input by
+/// checking the element count before calling `TDigest::from_scalar_state`,
+/// which would panic on invalid shape.
+pub fn sketch_from_proto(
+    proto: &crate::serde::protobuf::QuantileSketchState,
+) -> Result<datafusion_functions_aggregate_common::tdigest::TDigest> {
+    let scalars = proto
+        .state
+        .iter()
+        .map(datafusion::common::ScalarValue::try_from)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| {
+            internal_datafusion_err!(
+                "failed to decode QuantileSketchState scalars: {e:?}"
+            )
+        })?;
+    if scalars.len() != 6 {
+        return internal_err!(
+            "QuantileSketchState: expected 6 elements per TDigest::to_scalar_state, got {} \
+             — likely wire corruption",
+            scalars.len()
+        );
+    }
+    Ok(
+        datafusion_functions_aggregate_common::tdigest::TDigest::from_scalar_state(
+            &scalars,
+        ),
+    )
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use datafusion_functions_aggregate_common::tdigest::TDigest;
+
+    /// Round-trip a populated T-Digest through the wire. Count / min / max
+    /// should survive unchanged; quantile queries should agree to within
+    /// floating-point equality since serde is lossless.
+    #[test]
+    fn tdigest_wire_roundtrip_preserves_populated_sketch() {
+        let mut original = TDigest::new(100);
+        original = original
+            .merge_unsorted_f64(vec![1.0, 5.0, 10.0, 20.0, 30.0, 50.0, 75.0, 100.0]);
+        let proto = sketch_to_proto(&original).unwrap();
+        let decoded = sketch_from_proto(&proto).unwrap();
+        assert_eq!(decoded.count(), original.count());
+        assert_eq!(decoded.min(), original.min());
+        assert_eq!(decoded.max(), original.max());
+        // Quantile agreement at the median.
+        assert_eq!(
+            decoded.estimate_quantile(0.5),
+            original.estimate_quantile(0.5),
+        );
+    }
+
+    /// Empty T-Digest — zero centroids, no samples — still survives the
+    /// round-trip. This is the case an executor hits when a `RuntimeStatsExec`
+    /// was present in the plan but no batches flowed through (e.g. empty
+    /// input partition).
+    #[test]
+    fn tdigest_wire_roundtrip_preserves_empty_sketch() {
+        let original = TDigest::new(100);
+        let proto = sketch_to_proto(&original).unwrap();
+        let decoded = sketch_from_proto(&proto).unwrap();
+        assert_eq!(decoded.count(), 0.0);
+        assert_eq!(decoded.max_size(), original.max_size());
+    }
+
+    /// Corrupted wire input (wrong element count) is caught before
+    /// `TDigest::from_scalar_state` gets a chance to panic.
+    #[test]
+    fn sketch_from_proto_rejects_wrong_shape() {
+        use datafusion::common::ScalarValue;
+        let proto = crate::serde::protobuf::QuantileSketchState {
+            state: (0..3)
+                .map(|_| {
+                    datafusion_proto_common::ScalarValue::try_from(&ScalarValue::Float64(
+                        Some(0.0),
+                    ))
+                    .unwrap()
+                })
+                .collect(),
+        };
+        let err = sketch_from_proto(&proto)
+            .expect_err("wrong-count wire input must be rejected before decode");
+        assert!(
+            err.to_string().contains("expected 6 elements"),
+            "got: {err}"
+        );
+    }
+}
