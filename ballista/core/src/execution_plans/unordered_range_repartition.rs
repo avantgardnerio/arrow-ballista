@@ -335,6 +335,13 @@ async fn scatter_input_partition(
         let cuts = cuts_cell.get_or_init(|| {
             discover_cuts(&child, routing_expr.as_ref(), output_partitions)
         });
+        // TODO(perf): `split_batch_by_range` materialises K sub-batches per
+        // input batch via `take_arrays` — one copy per row into a fresh
+        // allocation. Unlike the ordered variant we can't slice
+        // contiguous ranges (input isn't sorted), but an
+        // `Arc<RecordBatch>` broadcast + receiver-side filter would skip
+        // the scatter-side allocations at the cost of duplicating the
+        // filter work K times. Worth measuring under skew.
         match split_batch_by_range(&batch, &routing_expr, cuts) {
             Ok(splits) => {
                 for (output, sub) in splits.into_iter().enumerate() {
