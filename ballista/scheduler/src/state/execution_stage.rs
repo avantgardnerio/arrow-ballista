@@ -1037,20 +1037,46 @@ impl Debug for FailedStage {
     }
 }
 
-/// Get the total number of partitions for a stage with plan.
-/// Only for shuffle writers, the input partition count and the output partition count
-/// will be different. Here, we should use the input partition count.
+/// Sum of output-partition counts across every leaf of `plan`. Leaves are
+/// where physical work originates (scans, shuffle reads, empty execs);
+/// intermediate operators — including partition-count-changing ones like
+/// DynamicRangeRepartitionExec — are walked past. Multi-child operators
+/// (union, join) sum across branches, matching how task work fans out.
+///
+/// This gives task assignment the true amount of input work in a stage,
+/// independent of any within-stage repartitioning that would otherwise
+/// obscure it in `plan.output_partitioning().partition_count()`.
+fn sum_leaf_scan_partitions(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    let children = plan.children();
+    if children.is_empty() {
+        return plan.properties().output_partitioning().partition_count();
+    }
+    children.into_iter().map(sum_leaf_scan_partitions).sum()
+}
+
+/// TODO: read from ExecutorSpecification.task_slots via the cluster manager
+/// instead of hardcoding. This is placeholder for the substrate work — the
+/// number here should be "how many cores a single task can drive on one
+/// executor," which is what --concurrent-tasks controls today.
+const TODO_EXECUTOR_CORES: usize = 4;
+
+/// Get the number of task slots for a stage.
+///
+/// One task per executor slot, each task drives `executor_cores` partitions
+/// through one plan-Arc — that's the substrate the parallel-window PR (and
+/// any future coordinating operator) needs. `ceil(leaf_sum / cores)` tasks
+/// covers the input; each task iterates its assigned partitions internally
+/// via DataFusion's native parallelism.
 fn get_stage_partitions(plan: Arc<dyn ExecutionPlan>) -> usize {
-    // Try ShuffleWriterExec first
-    if let Some(shuffle_writer) = plan.downcast_ref::<ShuffleWriterExec>() {
-        return shuffle_writer.input_partition_count();
-    }
-    // Try SortShuffleWriterExec
-    if let Some(shuffle_writer) = plan.downcast_ref::<SortShuffleWriterExec>() {
-        return shuffle_writer.input_partition_count();
-    }
-    // Fallback to output partitioning
-    plan.properties().output_partitioning().partition_count()
+    let leaf_sum = if plan.downcast_ref::<ShuffleWriterExec>().is_some()
+        || plan.downcast_ref::<SortShuffleWriterExec>().is_some()
+    {
+        // Walk past the shuffle writer to its child chain, sum leaves.
+        sum_leaf_scan_partitions(&plan.children()[0].clone())
+    } else {
+        plan.properties().output_partitioning().partition_count()
+    };
+    leaf_sum.div_ceil(TODO_EXECUTOR_CORES).max(1)
 }
 
 /// This data structure collects the partition locations for an `ExecutionStage`.

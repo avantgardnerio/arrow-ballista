@@ -201,12 +201,15 @@ impl ShuffleWriterExec {
     }
 
     /// Executes the shuffle write operation for a single input partition.
+    ///
+    /// `task_slot` is the task's index within the stage — used as the file_id
+    /// so multi-task stages don't collide on shuffle paths.
     pub fn execute_shuffle_write(
         self,
-        input_partition: usize,
+        task_slot: usize,
         context: Arc<TaskContext>,
     ) -> impl Future<Output = Result<Vec<ShuffleWritePartition>>> {
-        let write_metrics = ShuffleWriteMetrics::new(input_partition, &self.metrics);
+        let write_metrics = ShuffleWriteMetrics::new(task_slot, &self.metrics);
         let output_partitioning = self.shuffle_output_partitioning.clone();
         let plan = self.plan.clone();
 
@@ -216,60 +219,92 @@ impl ShuffleWriterExec {
                 .session_config()
                 .ballista_config()
                 .shuffle_writer_channel_capacity();
-            let mut stream = plan.execute(input_partition, context)?;
 
             match output_partitioning {
                 None => {
-                    let path = create_shuffle_path(
-                        &self.work_dir,
-                        &self.job_id,
-                        self.stage_id,
-                        input_partition,
-                        None,
-                        false,
-                    )?;
+                    // Passthrough shuffle: drain each of the child's output
+                    // partitions into its own file. All K must drain
+                    // CONCURRENTLY, not sequentially — coordinating operators
+                    // below (DynamicRangeRepartitionExec) push to all K
+                    // senders from shared scatter tasks; draining one to EOF
+                    // before the next starts fills up the undrained channel
+                    // and deadlocks the scatter side.
+                    let num_partitions =
+                        plan.properties().output_partitioning().partition_count();
+                    let mut handles = Vec::with_capacity(num_partitions);
+                    for output_partition in 0..num_partitions {
+                        let path = create_shuffle_path(
+                            &self.work_dir,
+                            &self.job_id,
+                            self.stage_id,
+                            output_partition,
+                            Some(task_slot as u64),
+                            false,
+                        )?;
 
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent)?;
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+
+                        debug!("Writing results to {path:?}");
+
+                        let mut stream =
+                            plan.execute(output_partition, context.clone())?;
+                        let write_time = write_metrics.write_time.clone();
+                        handles.push(tokio::spawn(async move {
+                            let stats = utils::write_stream_to_disk(
+                                &mut stream,
+                                path.as_path(),
+                                &write_time,
+                                channel_capacity,
+                            )
+                            .await
+                            .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+                            Ok::<_, DataFusionError>((output_partition, stats))
+                        }));
                     }
 
-                    debug!("Writing results to {path:?}");
-
-                    let stats = utils::write_stream_to_disk(
-                        &mut stream,
-                        path.as_path(),
-                        &write_metrics.write_time,
-                        channel_capacity,
-                    )
-                    .await
-                    .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
-
-                    write_metrics
-                        .input_rows
-                        .add(stats.num_rows.unwrap_or(0) as usize);
-                    write_metrics
-                        .output_rows
-                        .add(stats.num_rows.unwrap_or(0) as usize);
-
+                    let mut results = Vec::with_capacity(num_partitions);
+                    for handle in handles {
+                        let (output_partition, stats) = handle.await.map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "shuffle-write drain task panicked: {e}"
+                            ))
+                        })??;
+                        write_metrics
+                            .input_rows
+                            .add(stats.num_rows.unwrap_or(0) as usize);
+                        write_metrics
+                            .output_rows
+                            .add(stats.num_rows.unwrap_or(0) as usize);
+                        results.push(ShuffleWritePartition {
+                            partition_id: output_partition as u64,
+                            num_batches: stats.num_batches.unwrap_or(0),
+                            num_rows: stats.num_rows.unwrap_or(0),
+                            num_bytes: stats.num_bytes.unwrap_or(0),
+                            file_id: Some(task_slot as u64),
+                            is_sort_shuffle: false,
+                        });
+                    }
                     debug!(
-                        "Executed partition {} in {} seconds. Statistics: {}",
-                        input_partition,
-                        now.elapsed().as_secs(),
-                        stats
+                        "task_slot {} drained {} partitions in {}s",
+                        task_slot,
+                        num_partitions,
+                        now.elapsed().as_secs()
                     );
-
-                    Ok(vec![ShuffleWritePartition {
-                        partition_id: input_partition as u64,
-                        num_batches: stats.num_batches.unwrap_or(0),
-                        num_rows: stats.num_rows.unwrap_or(0),
-                        num_bytes: stats.num_bytes.unwrap_or(0),
-                        file_id: None,
-                        is_sort_shuffle: false,
-                    }])
+                    Ok(results)
                 }
-
+                // TODO: just use Datafusion's hash partition operator and remove this branch
                 Some(Partitioning::Hash(exprs, num_output_partitions)) => {
-                    let schema = stream.schema();
+                    // Task drains ALL of the child's input partitions and
+                    // routes rows into K writers by hash. file_id = task_slot
+                    // so shuffle files from different tasks don't collide.
+                    // Plan-rewrite-at-dispatch (upcoming) will restrict the
+                    // scan to this task's assigned file_groups, so "all input
+                    // partitions" ends up meaning this task's slice.
+                    let num_input_partitions =
+                        plan.properties().output_partitioning().partition_count();
+                    let schema = plan.schema();
                     let (tx, mut rx) =
                         tokio::sync::mpsc::channel::<RecordBatch>(channel_capacity);
                     let write_time = write_metrics.write_time.clone();
@@ -305,7 +340,7 @@ impl ShuffleWriterExec {
                                                 &job_id,
                                                 stage_id,
                                                 output_partition,
-                                                Some(input_partition as u64),
+                                                Some(task_slot as u64),
                                                 false,
                                             )?;
 
@@ -358,7 +393,7 @@ impl ShuffleWriterExec {
                                     num_batches: w.num_batches as u64,
                                     num_rows: w.num_rows as u64,
                                     num_bytes,
-                                    file_id: Some(input_partition as u64),
+                                    file_id: Some(task_slot as u64),
                                     is_sort_shuffle: false,
                                 });
                             }
@@ -366,18 +401,26 @@ impl ShuffleWriterExec {
                         Ok(part_locs)
                     });
 
-                    let stream_err = loop {
-                        match stream.next().await {
-                            Some(Ok(batch)) => {
-                                write_metrics.input_rows.add(batch.num_rows());
-                                if tx.send(batch).await.is_err() {
-                                    break None;
+                    let mut stream_err = None;
+                    'outer: for input_partition in 0..num_input_partitions {
+                        let mut stream =
+                            plan.execute(input_partition, context.clone())?;
+                        loop {
+                            match stream.next().await {
+                                Some(Ok(batch)) => {
+                                    write_metrics.input_rows.add(batch.num_rows());
+                                    if tx.send(batch).await.is_err() {
+                                        break 'outer;
+                                    }
                                 }
+                                Some(Err(e)) => {
+                                    stream_err = Some(e);
+                                    break 'outer;
+                                }
+                                None => break,
                             }
-                            Some(Err(e)) => break Some(e),
-                            None => break None,
                         }
-                    };
+                    }
                     drop(tx);
 
                     let write_result = handle.await.map_err(|e| {
