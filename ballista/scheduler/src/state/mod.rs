@@ -49,6 +49,8 @@ pub mod execution_stage;
 pub mod executor_manager;
 /// Session state management.
 pub mod session_manager;
+/// Per-task plan rewriter (restrict scan/shuffle-reader to task's slice).
+pub mod task_builder;
 /// Task scheduling and lifecycle management.
 pub mod task_manager;
 

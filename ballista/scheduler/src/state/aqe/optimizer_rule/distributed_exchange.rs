@@ -16,6 +16,9 @@
 // under the License.
 
 use crate::state::aqe::execution_plan::{AdaptiveDatafusionExec, ExchangeExec};
+use ballista_core::execution_plans::{
+    OrderedRangeRepartitionExec, RuntimeStatsExec, UnorderedRangeRepartitionExec,
+};
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
@@ -90,6 +93,29 @@ impl DistributedExchangeRule {
                 );
                 return Ok(Transformed::yes(Arc::new(exchange_exec)));
             }
+        } else if execution_plan.downcast_ref::<RuntimeStatsExec>().is_some()
+            && let [child] = execution_plan.children().as_slice()
+            && (child
+                .downcast_ref::<UnorderedRangeRepartitionExec>()
+                .is_some()
+                || child
+                    .downcast_ref::<OrderedRangeRepartitionExec>()
+                    .is_some())
+            && !matches!(nearest_exchange_status(child), ExchangeStatus::Unresolved)
+        {
+            // Parallel-window Stage-1 terminator: keep post-DRR RuntimeStatsExec
+            // + the range-repartition together on the source-stage side of the
+            // shuffle so the executor's report walker (which starts at the
+            // ShuffleWriter and stops at non-whitelisted operators) can reach
+            // the stats. Wrap self in an ExchangeExec — partitioning=None
+            // means the exchange inherits DRR's K output partitioning.
+            let exchange_exec = ExchangeExec::new(
+                execution_plan.clone(),
+                None,
+                self.plan_id_generator
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            );
+            return Ok(Transformed::yes(Arc::new(exchange_exec)));
         }
         Ok(Transformed::no(execution_plan))
     }

@@ -48,8 +48,8 @@ use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{WindowFrameBound, WindowFrameUnits};
 use datafusion::physical_expr::expressions::Column;
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::windows::BoundedWindowAggExec;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use log::info;
 use std::sync::Arc;
 
@@ -84,11 +84,13 @@ impl PhysicalOptimizerRule for ParallelWindowDetectRule {
                     children.len()
                 );
             };
-            // K defaults to the input's partition count — inherit the parallelism
-            // level Ballista already spun up. Real production K comes from a
-            // cluster-shape config; that lands with the AQE Barrier 1.5 rule
-            // that also feeds the sketch-derived cuts.
-            let k = bwag_input.output_partitioning().partition_count().max(2);
+            // K should be total cluster cores (sum of task_slots across
+            // registered executors) — Stage 2 gets one sub-partition per core,
+            // no over- or under-sampling. Hardcoded to 8 for the local test
+            // cluster (2 execs × 4 --concurrent-tasks each). See TODO at
+            // `grpc.rs::create_or_update_session` for the real plumbing site.
+            // TODO: un-hard-code
+            let k = 8;
             // Build the Stage-1 chain from bottom up:
             //   1. Pre-DRR RuntimeStatsExec (sketch mode) — feeds DRR's local
             //      cut discovery via `discover_cuts`.

@@ -342,6 +342,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
         let session_params = request.into_inner();
 
         let session_config = self.state.session_manager.produce_config();
+        // TODO: compute total cluster cores (sum of task_slots across
+        // registered executors from ClusterState.registered_executor_metadata())
+        // and inject it here so downstream rules like ParallelWindowDetectRule
+        // can size their output partition counts to actual cluster shape
+        // instead of hardcoding.
         let session_config =
             session_config.update_from_key_value_pair(&session_params.settings);
 
