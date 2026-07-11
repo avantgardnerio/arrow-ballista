@@ -142,11 +142,13 @@ impl ExecutorManager {
 
         for task_info in tasks {
             let infos = tasks_to_cancel.entry(task_info.executor_id).or_default();
+            // TODO(c4a.2): task_info.partition_id (Rust RunningTaskInfo)
+            // is semantically task_index — rename in RunningTaskInfo too.
             infos.push(protobuf::RunningTaskInfo {
                 task_id: task_info.task_id as u32,
                 job_id: task_info.job_id.into(),
                 stage_id: task_info.stage_id as u32,
-                partition_id: task_info.partition_id as u32,
+                task_index: task_info.partition_id as u32,
             });
         }
 

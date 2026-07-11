@@ -368,19 +368,23 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         let job_id = task.job_id;
         let stage_id = task.stage_id;
         let stage_attempt_num = task.stage_attempt_num;
-        let partition_id = task.partition_id;
+        let task_index = task.task_index;
         let plan = task.plan;
 
+        // TODO(c4a.2): PartitionId here really identifies (job, stage, task
+        // slot), not (job, stage, partition). Replace with TaskKey.
         let part = PartitionId {
             job_id: job_id.clone(),
             stage_id,
-            partition_id,
+            partition_id: task_index,
         };
 
+        // TODO(c4a.2): create_query_stage_exec's third arg is named
+        // `partition` but is now task_index. TaskKey rework should update.
         let exec = self.executor.execution_engine.create_query_stage_exec(
             job_id.clone(),
             stage_id,
-            partition_id,
+            task_index,
             plan,
             &self.executor.work_dir,
             &task.session_config,
@@ -786,7 +790,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskRunnerPool<T,
                         curator_task.task.job_id,
                         curator_task.task.stage_id,
                         curator_task.task.stage_attempt_num,
-                        curator_task.task.partition_id,
+                        curator_task.task.task_index,
                         curator_task.task.task_attempt_num,
                     );
                     debug!("Received task {:?}", task_identity);
@@ -921,7 +925,9 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
                     task.task_id as usize,
                     task.job_id.into(),
                     task.stage_id as usize,
-                    task.partition_id as usize,
+                    // TODO(c4a.2): cancel_task's `partition_id` arg is
+                    // semantically task_index here.
+                    task.task_index as usize,
                 )
                 .await
             {

@@ -159,14 +159,18 @@ where
                             // as scheduler expects notification.
                             //
 
-                            let partition_id = PartitionId {
+                            let task_index = task.task_index as usize;
+                            // TODO(c4a.2): PartitionId.partition_id is
+                            // semantically task_index here — replace with
+                            // TaskKey when it lands.
+                            let task_key = PartitionId {
                                 job_id: task.job_id.clone().into(),
                                 stage_id: task.stage_id as usize,
-                                partition_id: task.partition_id as usize,
+                                partition_id: task_index,
                             };
 
                             warn!(
-                                "Executor failed to run task: {partition_id:?}, error: {e:?}"
+                                "Executor failed to run task: {task_key:?}, error: {e:?}"
                             );
 
                             let end_exec_time = SystemTime::now()
@@ -187,7 +191,7 @@ where
                                 executor.metadata.id.clone(),
                                 task.task_id as usize,
                                 task.task_attempt_num as usize,
-                                partition_id,
+                                task_key,
                                 None,
                                 task_execution_times,
                             )) {
@@ -237,13 +241,13 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     let stage_id = task.stage_id;
     let stage_attempt_num = task.stage_attempt_num;
     let task_launch_time = task.launch_time;
-    let partition_id = task.partition_id;
+    let task_index = task.task_index;
     let start_exec_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64;
     let task_identity = format!(
-        "TID {task_id} {job_id}/{stage_id}.{stage_attempt_num}/{partition_id}.{task_attempt_num}"
+        "TID {task_id} {job_id}/{stage_id}.{stage_attempt_num}/{task_index}.{task_attempt_num}"
     );
     info!("Received task: [{task_identity}]");
 
@@ -280,20 +284,25 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             proto.try_into_physical_plan(&task_context, codec.physical_extension_codec())
         })?;
 
+    // TODO(c4a.2): create_query_stage_exec still takes partition_id
+    // (semantically task_index now under substrate) — TaskKey rework
+    // should update that receiver too.
     let query_stage_exec = executor.execution_engine.create_query_stage_exec(
         job_id.clone(),
         stage_id as usize,
-        partition_id as usize,
+        task_index as usize,
         plan,
         &executor.work_dir,
         task_context.session_config(),
     )?;
     dedicated_executor.spawn(async move {
         use std::panic::AssertUnwindSafe;
+        // TODO(c4a.2): PartitionId.partition_id is semantically task_index
+        // here — replace with TaskKey when it lands.
         let part = PartitionId {
             job_id: job_id.clone(),
             stage_id: stage_id as usize,
-            partition_id: partition_id as usize,
+            partition_id: task_index as usize,
         };
 
         let task_start = Instant::now();

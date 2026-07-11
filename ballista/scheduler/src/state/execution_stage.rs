@@ -1170,13 +1170,13 @@ mod tests {
         )
     }
 
-    fn make_task_status(task_id: u32, partition_id: u32) -> TaskStatus {
+    fn make_task_status(task_id: u32, task_index: u32) -> TaskStatus {
         TaskStatus {
             task_id,
             job_id: "test-job".to_string(),
             stage_id: 1,
             stage_attempt_num: 0,
-            partition_id,
+            task_index,
             launch_time: 100,
             start_exec_time: 200,
             end_exec_time: 300,

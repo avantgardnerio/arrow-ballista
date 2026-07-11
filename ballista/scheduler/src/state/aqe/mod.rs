@@ -656,17 +656,17 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                             );
                             continue;
                         }
-                        let partition_id = task_status.partition_id as usize;
+                        let task_index = task_status.task_index as usize;
                         let task_identity = format!(
                             "TID {} {}/{}.{}/{}",
                             task_status.task_id,
                             job_id,
                             stage_id,
                             task_stage_attempt_num,
-                            partition_id
+                            task_index
                         );
 
-                        if !running_stage.update_task_info(partition_id, &task_status) {
+                        if !running_stage.update_task_info(task_index, &task_status) {
                             continue;
                         }
 
@@ -750,16 +750,16 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                                     if failed_task.retryable
                                         && failed_task.count_to_failures
                                     {
-                                        if running_stage.task_failure_number(partition_id)
+                                        if running_stage.task_failure_number(task_index)
                                             < max_task_failures
                                         {
                                             // TODO add new struct to track all the failed task infos
                                             // The failure TaskInfo is ignored and set to None here
-                                            running_stage.reset_task_info(partition_id);
+                                            running_stage.reset_task_info(task_index);
                                         } else {
                                             let error_msg = format!(
                                                 "Task {} in Stage {} failed {} times, fail the stage, most recent failure reason: {:?}",
-                                                partition_id,
+                                                task_index,
                                                 stage_id,
                                                 max_task_failures,
                                                 failed_task.error
@@ -770,12 +770,12 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                                     } else if failed_task.retryable {
                                         // TODO add new struct to track all the failed task infos
                                         // The failure TaskInfo is ignored and set to None here
-                                        running_stage.reset_task_info(partition_id);
+                                        running_stage.reset_task_info(task_index);
                                     }
                                 }
                                 None => {
                                     let error_msg = format!(
-                                        "Task {partition_id} in Stage {stage_id} failed with unknown failure reasons, fail the stage"
+                                        "Task {task_index} in Stage {stage_id} failed with unknown failure reasons, fail the stage"
                                     );
                                     error!("{error_msg}");
                                     failed_stages.insert(stage_id, error_msg);
@@ -791,12 +791,12 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                         {
                             // update task metrics for successfu task
                             running_stage
-                                .update_task_metrics(partition_id, operator_metrics)?;
+                                .update_task_metrics(task_index, operator_metrics)?;
 
                             locations.append(
                                 &mut crate::state::execution_graph::partition_to_location(
                                     &job_id,
-                                    partition_id,
+                                    task_index,
                                     stage_id,
                                     executor,
                                     successful_task.partitions,
@@ -849,7 +849,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                         stage_id,
                         stage_task_statuses
                             .into_iter()
-                            .map(|task_status| task_status.partition_id)
+                            .map(|task_status| task_status.task_index)
                             .collect::<Vec<_>>(),
                     );
                 }
@@ -956,12 +956,14 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                     stage
                         .running_tasks()
                         .into_iter()
-                        .map(|(task_id, stage_id, partition_id, executor_id)| {
+                        .map(|(task_id, stage_id, task_index, executor_id)| {
                             RunningTaskInfo {
                                 task_id,
                                 job_id: self.job_id.clone(),
                                 stage_id,
-                                partition_id,
+                                // TODO(c4a.2): RunningTaskInfo.partition_id
+                                // (Rust) is semantically task_index — rename.
+                                partition_id: task_index,
                                 executor_id,
                             }
                         })
@@ -1113,11 +1115,13 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                 .running_tasks()
                 .into_iter()
                 .map(
-                    |(task_id, stage_id, partition_id, executor_id)| RunningTaskInfo {
+                    |(task_id, stage_id, task_index, executor_id)| RunningTaskInfo {
                         task_id,
                         job_id: self.job_id.clone(),
                         stage_id,
-                        partition_id,
+                        // TODO(c4a.2): RunningTaskInfo.partition_id (Rust)
+                        // is semantically task_index — rename.
+                        partition_id: task_index,
                         executor_id,
                     },
                 )
@@ -1277,7 +1281,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
             if let ExecutionStage::Running(stage) = stage {
                 use ballista_core::serde::scheduler::PartitionId;
 
-                let (partition_id, _) = stage
+                let (task_index, _) = stage
                     .task_infos
                     .iter()
                     .enumerate()
@@ -1286,14 +1290,16 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                         BallistaError::Internal(format!("Error getting next task for job {job_id}: Stage {stage_id} is ready but has no pending tasks"))
                     })?;
 
+                // TODO(c4a.2): PartitionId here really identifies (job,
+                // stage, task slot). Replace with TaskKey.
                 let partition = PartitionId {
                     job_id,
                     stage_id: *stage_id,
-                    partition_id,
+                    partition_id: task_index,
                 };
 
                 let task_id = next_task_id.unwrap();
-                let task_attempt = stage.task_failure_numbers[partition_id];
+                let task_attempt = stage.task_failure_numbers[task_index];
                 let task_info = crate::state::execution_graph::TaskInfo {
                     task_id,
                     scheduled_time: timestamp_millis() as u128,
@@ -1308,7 +1314,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                 };
 
                 // Set the task info to Running for new task
-                stage.task_infos[partition_id] = Some(task_info);
+                stage.task_infos[task_index] = Some(task_info);
 
                 Ok(crate::state::execution_graph::TaskDescription {
                     session_id,

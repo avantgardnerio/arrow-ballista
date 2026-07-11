@@ -553,7 +553,9 @@ mod test {
                     job_id: task.partition.job_id.clone().into(),
                     stage_id: task.partition.stage_id as u32,
                     stage_attempt_num: task.stage_attempt_num as u32,
-                    partition_id: task.partition.partition_id as u32,
+                    // TODO(c4a.2): RHS is TaskDescription.partition.partition_id,
+                    // semantically task_index — becomes TaskKey.task_index.
+                    task_index: task.partition.partition_id as u32,
                     launch_time: 0,
                     start_exec_time: 0,
                     end_exec_time: 0,
@@ -750,7 +752,7 @@ mod test {
 
                 for TaskId {
                     task_id,
-                    partition_id,
+                    task_index,
                     ..
                 } in task.task_ids
                 {
@@ -760,7 +762,7 @@ mod test {
                         job_id: task.job_id.clone(),
                         stage_id: task.stage_id,
                         stage_attempt_num: task.stage_attempt_num,
-                        partition_id,
+                        task_index,
                         launch_time: timestamp,
                         start_exec_time: timestamp,
                         end_exec_time: timestamp,
@@ -826,7 +828,7 @@ mod test {
 
                 for TaskId {
                     task_id,
-                    partition_id,
+                    task_index,
                     ..
                 } in task.task_ids
                 {
@@ -836,7 +838,7 @@ mod test {
                         job_id: task.job_id.clone(),
                         stage_id: task.stage_id,
                         stage_attempt_num: task.stage_attempt_num,
-                        partition_id,
+                        task_index,
                         launch_time: timestamp,
                         start_exec_time: timestamp,
                         end_exec_time: timestamp,

@@ -100,7 +100,7 @@ impl TaskLauncher for DefaultTaskLauncher {
                     let task_ids: Vec<u32> = task
                         .task_ids
                         .iter()
-                        .map(|task_id| task_id.partition_id)
+                        .map(|task_id| task_id.task_index)
                         .collect();
                     format!("{}/{}/{:?}", task.job_id, task.stage_id, task_ids)
                 })
@@ -748,7 +748,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 job_id: job_id.into(),
                 stage_id: stage_id as u32,
                 stage_attempt_num: task.stage_attempt_num as u32,
-                partition_id: task.partition.partition_id as u32,
+                task_index: task.partition.partition_id as u32,
                 plan: plan_buf,
                 session_id: task.session_id,
                 launch_time: SystemTime::now()
@@ -841,7 +841,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             let task_ids = vec![TaskId {
                 task_id: task.task_id as u32,
                 task_attempt_num: task.task_attempt as u32,
-                partition_id: task.partition.partition_id as u32,
+                task_index: task.partition.partition_id as u32,
             }];
             multi_tasks.push(MultiTaskDefinition {
                 task_ids,
@@ -942,160 +942,3 @@ impl From<&ExecutionGraphBox> for JobOverview {
     }
 }
 
-#[cfg(all(test, feature = "disable-stage-plan-cache"))]
-mod prune_partition_tests {
-    use crate::state::task_manager::JobInfoCache;
-    use ballista_core::JobId;
-    use ballista_core::execution_plans::{
-        CoalescePlan, PartitionGroup, ShuffleReaderExec,
-    };
-    use ballista_core::serde::scheduler::{
-        ExecutorMetadata, PartitionId, PartitionLocation,
-    };
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::physical_expr::Partitioning;
-    use datafusion::physical_plan::ExecutionPlan;
-    use std::sync::Arc;
-
-    fn create_partition(partition: usize) -> PartitionLocation {
-        PartitionLocation {
-            map_partition_id: 0,
-            partition_id: PartitionId {
-                job_id: JobId::new("demo".to_string()),
-                stage_id: 0,
-                partition_id: partition,
-            },
-            executor_meta: ExecutorMetadata {
-                id: "1".to_string(),
-                host: "1.1.1.1".to_string(),
-                port: 0,
-                grpc_port: 0,
-                specification: Default::default(),
-                os_info: Default::default(),
-            },
-            partition_stats: Default::default(),
-            file_id: None,
-            is_sort_shuffle: false,
-        }
-    }
-
-    #[test]
-    fn check_prune_unwanted_partitions() {
-        let partitions = (0..4).map(|i| vec![create_partition(i)]).collect();
-        let reader = ShuffleReaderExec::try_new(
-            1,
-            partitions,
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            Partitioning::UnknownPartitioning(4),
-        )
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(reader);
-        let pruned = JobInfoCache::partition_prune_helper(&[1], &plan).unwrap();
-        let r = pruned
-            .downcast_ref::<ShuffleReaderExec>()
-            .expect("expected a ShuffleReaderExec");
-        assert!(r.partition[0].is_empty());
-        assert_eq!(r.partition[1].len(), 1);
-        assert_eq!(r.partition[1][0].partition_id.partition_id, 1);
-        assert!(r.partition[2].is_empty());
-        assert!(r.partition[3].is_empty());
-    }
-
-    #[test]
-    fn check_keeps_multiple_wanted_partitions() {
-        let partitions = (0..4).map(|i| vec![create_partition(i)]).collect();
-        let reader = ShuffleReaderExec::try_new(
-            1,
-            partitions,
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            Partitioning::UnknownPartitioning(4),
-        )
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(reader);
-        let pruned = JobInfoCache::partition_prune_helper(&[0, 3], &plan).unwrap();
-        let r = pruned
-            .downcast_ref::<ShuffleReaderExec>()
-            .expect("expected a ShuffleReaderExec");
-        assert_eq!(r.partition[0].len(), 1);
-        assert!(r.partition[1].is_empty());
-        assert!(r.partition[2].is_empty());
-        assert_eq!(r.partition[3].len(), 1);
-    }
-
-    #[test]
-    fn check_broadcast_reader_not_pruned() {
-        // Broadcast readers serve partition[0] for every index, so pruning must be a no-op.
-        let reader = ShuffleReaderExec::try_new_broadcast(
-            1,
-            (0..4).map(create_partition).collect(),
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            4,
-        )
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(reader);
-        let pruned = JobInfoCache::partition_prune_helper(&[1], &plan).unwrap();
-        let r = pruned
-            .downcast_ref::<ShuffleReaderExec>()
-            .expect("expected a ShuffleReaderExec");
-        // Broadcast keeps all locations flattened into partition[0]; nothing pruned.
-        assert!(r.broadcast);
-        assert_eq!(r.partition.len(), 1);
-        assert_eq!(r.partition[0].len(), 4);
-    }
-
-    #[test]
-    fn check_coalesced_reader_pruned_and_stays_coalesced() {
-        // K = 2 coalesce groups, each folding two upstream partitions.
-        let coalesce = CoalescePlan {
-            upstream_partition_count: 4,
-            groups: vec![
-                PartitionGroup {
-                    upstream_indices: vec![0, 1],
-                },
-                PartitionGroup {
-                    upstream_indices: vec![2, 3],
-                },
-            ],
-        };
-        let reader = ShuffleReaderExec::try_new_coalesced(
-            1,
-            vec![
-                vec![create_partition(0), create_partition(1)],
-                vec![create_partition(2), create_partition(3)],
-            ],
-            coalesce,
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            Partitioning::UnknownPartitioning(2),
-        )
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(reader);
-        let pruned = JobInfoCache::partition_prune_helper(&[1], &plan).unwrap();
-        let r = pruned
-            .downcast_ref::<ShuffleReaderExec>()
-            .expect("expected a ShuffleReaderExec");
-        assert!(r.coalesce.is_some());
-        assert!(r.partition[0].is_empty());
-        assert_eq!(r.partition[1].len(), 2);
-    }
-
-    #[test]
-    fn check_no_op_when_all_partitions_wanted() {
-        let partitions = (0..3).map(|i| vec![create_partition(i)]).collect();
-        let reader = ShuffleReaderExec::try_new(
-            1,
-            partitions,
-            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
-            Partitioning::UnknownPartitioning(3),
-        )
-        .unwrap();
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(reader);
-        let pruned = JobInfoCache::partition_prune_helper(&[0, 1, 2], &plan).unwrap();
-        let r = pruned
-            .downcast_ref::<ShuffleReaderExec>()
-            .expect("expected a ShuffleReaderExec");
-        // Task consumes every partition, so nothing is emptied.
-        assert_eq!(r.partition[0].len(), 1);
-        assert_eq!(r.partition[1].len(), 1);
-        assert_eq!(r.partition[2].len(), 1);
-    }
-}

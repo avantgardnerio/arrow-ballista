@@ -377,7 +377,7 @@ pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
 
     let job_id = task.job_id.into();
     let stage_id = task.stage_id as usize;
-    let partition_id = task.partition_id as usize;
+    let task_index = task.task_index as usize;
     let task_attempt_num = task.task_attempt_num as usize;
     let stage_attempt_num = task.stage_attempt_num as usize;
     let launch_time = task.launch_time;
@@ -390,7 +390,7 @@ pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         job_id,
         stage_id,
         stage_attempt_num,
-        partition_id,
+        task_index,
         plan,
         launch_time,
         session_id,
@@ -459,7 +459,7 @@ pub fn get_task_definition_vec<
                 job_id: job_id.clone(),
                 stage_id,
                 stage_attempt_num,
-                partition_id: task_id.partition_id as usize,
+                task_index: task_id.task_index as usize,
                 plan: reset_metrics_for_execution_plan(plan.clone())?,
                 launch_time,
                 session_id: session_id.clone(),

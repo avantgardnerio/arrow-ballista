@@ -424,6 +424,11 @@ pub struct PartitionId {
     #[prost(uint32, tag = "4")]
     pub partition_id: u32,
 }
+/// Within-stage task identity (paired with job_id + stage_id on the parent
+/// MultiTaskDefinition). Post-substrate one task processes a slice of
+/// partitions, so `task_index` names the task slot within the stage; the
+/// actual partition slice is baked into the plan bytes (Scan file_groups /
+/// ShuffleReader partitions restricted at dispatch).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TaskId {
     #[prost(uint32, tag = "1")]
@@ -431,7 +436,7 @@ pub struct TaskId {
     #[prost(uint32, tag = "2")]
     pub task_attempt_num: u32,
     #[prost(uint32, tag = "3")]
-    pub partition_id: u32,
+    pub task_index: u32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PartitionStats {
@@ -800,8 +805,10 @@ pub struct TaskStatus {
     pub stage_id: u32,
     #[prost(uint32, tag = "4")]
     pub stage_attempt_num: u32,
+    /// Task slot within the stage (was `partition_id` — under substrate one
+    /// task processes a partition slice, not a single partition).
     #[prost(uint32, tag = "5")]
-    pub partition_id: u32,
+    pub task_index: u32,
     #[prost(uint64, tag = "6")]
     pub launch_time: u64,
     #[prost(uint64, tag = "7")]
@@ -835,6 +842,9 @@ pub struct PollWorkParams {
     #[prost(message, repeated, tag = "3")]
     pub task_status: ::prost::alloc::vec::Vec<TaskStatus>,
 }
+/// Pull-based single-task dispatch. Post-substrate one task processes a
+/// slice of partitions, so `task_index` names the task slot within the
+/// stage; the actual partition slice is baked into the plan bytes.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TaskDefinition {
     #[prost(uint32, tag = "1")]
@@ -848,7 +858,7 @@ pub struct TaskDefinition {
     #[prost(uint32, tag = "5")]
     pub stage_attempt_num: u32,
     #[prost(uint32, tag = "6")]
-    pub partition_id: u32,
+    pub task_index: u32,
     #[prost(bytes = "vec", tag = "7")]
     pub plan: ::prost::alloc::vec::Vec<u8>,
     #[prost(string, tag = "9")]
@@ -1260,8 +1270,9 @@ pub struct RunningTaskInfo {
     pub job_id: ::prost::alloc::string::String,
     #[prost(uint32, tag = "3")]
     pub stage_id: u32,
+    /// Task slot within the stage (was `partition_id` — see TaskStatus).
     #[prost(uint32, tag = "4")]
-    pub partition_id: u32,
+    pub task_index: u32,
 }
 /// Generated client implementations.
 pub mod scheduler_grpc_client {

@@ -475,8 +475,12 @@ pub struct TaskDefinition {
     pub stage_id: usize,
     /// Current attempt number for the stage.
     pub stage_attempt_num: usize,
-    /// Partition to process.
-    pub partition_id: usize,
+    /// Task slot within the stage. Post-substrate one task processes a
+    /// slice of partitions, so this is not a partition index — it identifies
+    /// the task among the stage's tasks. The actual partition slice is
+    /// baked into `plan` (Scan file_groups / ShuffleReader partitions
+    /// restricted at dispatch).
+    pub task_index: usize,
     /// Physical execution plan for this task.
     pub plan: Arc<dyn ExecutionPlan>,
     /// Timestamp when the task was launched.
