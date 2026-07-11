@@ -729,11 +729,11 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
     ) -> Result<TaskDefinition> {
         debug!("Preparing task definition for {task:?}");
 
-        let job_id = task.partition.job_id.clone();
-        let stage_id = task.partition.stage_id;
+        let job_id = task.key.job_id.clone();
+        let stage_id = task.key.stage_id;
 
         if self.active_job_cache.get(&job_id).is_some() {
-            let slice = task_partition_slice(task.partition.partition_id);
+            let slice = task_partition_slice(task.key.task_index);
             let restricted = restrict_plan_to_partitions(task.plan.clone(), &slice)?;
             let mut plan_buf: Vec<u8> = vec![];
             let plan_proto = PhysicalPlanNode::try_from_physical_plan(
@@ -748,7 +748,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 job_id: job_id.into(),
                 stage_id: stage_id as u32,
                 stage_attempt_num: task.stage_attempt_num as u32,
-                task_index: task.partition.partition_id as u32,
+                task_index: task.key.task_index as u32,
                 plan: plan_buf,
                 session_id: task.session_id,
                 launch_time: SystemTime::now()
@@ -803,15 +803,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             ));
         };
         let session_id = first_task.session_id.clone();
-        let job_id = first_task.partition.job_id.clone();
-        let stage_id = first_task.partition.stage_id;
+        let job_id = first_task.key.job_id.clone();
+        let stage_id = first_task.key.stage_id;
         let stage_attempt_num = first_task.stage_attempt_num;
 
         if log::max_level() >= log::Level::Debug {
-            let task_ids: Vec<usize> = tasks
-                .iter()
-                .map(|task| task.partition.partition_id)
-                .collect();
+            let task_ids: Vec<usize> =
+                tasks.iter().map(|task| task.key.task_index).collect();
             debug!(
                 "Preparing multi task definition for tasks {task_ids:?} belonging to job stage {job_id}/{stage_id}"
             );
@@ -832,7 +830,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
         let mut multi_tasks = Vec::with_capacity(tasks.len());
         for task in tasks {
-            let slice = task_partition_slice(task.partition.partition_id);
+            let slice = task_partition_slice(task.key.task_index);
             let restricted = restrict_plan_to_partitions(task.plan.clone(), &slice)?;
             let mut plan_buf: Vec<u8> = vec![];
             let plan_proto = PhysicalPlanNode::try_from_physical_plan(restricted, codec)?;
@@ -841,7 +839,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
             let task_ids = vec![TaskId {
                 task_id: task.task_id as u32,
                 task_attempt_num: task.task_attempt as u32,
-                task_index: task.partition.partition_id as u32,
+                task_index: task.key.task_index as u32,
             }];
             multi_tasks.push(MultiTaskDefinition {
                 task_ids,

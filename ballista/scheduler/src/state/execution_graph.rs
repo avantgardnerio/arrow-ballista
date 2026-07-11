@@ -40,7 +40,7 @@ use ballista_core::serde::protobuf::{
 };
 use ballista_core::serde::protobuf::{RunningTask, task_status};
 use ballista_core::serde::scheduler::{
-    ExecutorMetadata, PartitionId, PartitionLocation, PartitionStats,
+    ExecutorMetadata, PartitionId, PartitionLocation, PartitionStats, TaskKey,
 };
 
 use crate::display::print_stage_metrics;
@@ -312,8 +312,8 @@ pub struct RunningTaskInfo {
     pub job_id: JobId,
     /// The stage ID this task belongs to.
     pub stage_id: usize,
-    /// The partition this task is processing.
-    pub partition_id: usize,
+    /// Task slot within the stage.
+    pub task_index: usize,
     /// The executor ID where this task is running.
     pub executor_id: String,
 }
@@ -1163,12 +1163,12 @@ impl ExecutionGraph for StaticExecutionGraph {
                     stage
                         .running_tasks()
                         .into_iter()
-                        .map(|(task_id, stage_id, partition_id, executor_id)| {
+                        .map(|(task_id, stage_id, task_index, executor_id)| {
                             RunningTaskInfo {
                                 task_id,
                                 job_id: self.job_id.clone(),
                                 stage_id,
-                                partition_id,
+                                task_index,
                                 executor_id,
                             }
                         })
@@ -1320,11 +1320,11 @@ impl ExecutionGraph for StaticExecutionGraph {
                 .running_tasks()
                 .into_iter()
                 .map(
-                    |(task_id, stage_id, partition_id, executor_id)| RunningTaskInfo {
+                    |(task_id, stage_id, task_index, executor_id)| RunningTaskInfo {
                         task_id,
                         job_id: self.job_id.clone(),
                         stage_id,
-                        partition_id,
+                        task_index,
                         executor_id,
                     },
                 )
@@ -1475,23 +1475,23 @@ impl ExecutionGraph for StaticExecutionGraph {
             }
         }).map(|(stage_id, stage)| {
             if let ExecutionStage::Running(stage) = stage {
-                let (partition_id, _) = stage
+                let (task_index, _) = stage
                     .task_infos
                     .iter()
                     .enumerate()
-                    .find(|(_partition, info)| info.is_none())
+                    .find(|(_task_slot, info)| info.is_none())
                     .ok_or_else(|| {
                         BallistaError::Internal(format!("Error getting next task for job {job_id}: Stage {stage_id} is ready but has no pending tasks"))
                     })?;
 
-                let partition = PartitionId {
+                let key = TaskKey {
                     job_id,
                     stage_id: *stage_id,
-                    partition_id,
+                    task_index,
                 };
 
                 let task_id = next_task_id.unwrap();
-                let task_attempt = stage.task_failure_numbers[partition_id];
+                let task_attempt = stage.task_failure_numbers[task_index];
                 let task_info = TaskInfo {
                     task_id,
                     scheduled_time: SystemTime::now()
@@ -1509,11 +1509,11 @@ impl ExecutionGraph for StaticExecutionGraph {
                 };
 
                 // Set the task info to Running for new task
-                stage.task_infos[partition_id] = Some(task_info);
+                stage.task_infos[task_index] = Some(task_info);
 
                 Ok(TaskDescription {
                     session_id,
-                    partition,
+                    key,
                     stage_attempt_num: stage.stage_attempt_num,
                     task_id,
                     task_attempt,
@@ -1688,14 +1688,14 @@ impl ExecutionPlanVisitor for ExecutionStageBuilder {
 
 /// Represents the basic unit of work for the Ballista executor.
 ///
-/// A `TaskDescription` contains all the information needed to execute
-/// one partition of one stage on a single executor task slot.
+/// Post-substrate one `TaskDescription` drives all of `partition_slice`'s
+/// partitions through one plan-Arc on the assigned executor.
 #[derive(Clone)]
 pub struct TaskDescription {
     /// The session ID associated with this task's job.
     pub session_id: String,
-    /// The partition identifier (job_id, stage_id, partition_id).
-    pub partition: PartitionId,
+    /// Task locator: (job_id, stage_id, task_index).
+    pub key: TaskKey,
     /// The attempt number for this stage (for retry tracking).
     pub stage_attempt_num: usize,
     /// Unique task ID within the execution graph.
@@ -1713,12 +1713,12 @@ impl Debug for TaskDescription {
         let plan = DisplayableExecutionPlan::new(self.plan.as_ref()).indent(false);
         write!(
             f,
-            "TaskDescription[session_id: {},job: {}, stage: {}.{}, partition: {} task_id {}, task attempt {}]\n{}",
+            "TaskDescription[session_id: {},job: {}, stage: {}.{}, task_index: {} task_id {}, task attempt {}]\n{}",
             self.session_id,
-            self.partition.job_id,
-            self.partition.stage_id,
+            self.key.job_id,
+            self.key.stage_id,
             self.stage_attempt_num,
-            self.partition.partition_id,
+            self.key.task_index,
             self.task_id,
             self.task_attempt,
             plan
@@ -2161,10 +2161,7 @@ mod test {
         // 2rd task's attempts
         for attempt in 1..5 {
             if let Some(task2_attempt) = agg_graph.pop_next_task(&executor.id)? {
-                assert_eq!(
-                    task2_attempt.partition.partition_id,
-                    task2.partition.partition_id
-                );
+                assert_eq!(task2_attempt.key.task_index, task2.key.task_index);
                 assert_eq!(task2_attempt.task_attempt, attempt);
                 last_attempt = task2_attempt.task_attempt;
                 let task_status = mock_failed_task(

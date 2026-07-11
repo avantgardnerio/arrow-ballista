@@ -33,7 +33,7 @@ use ballista_core::serde::protobuf::{
     PollWorkParams, PollWorkResult, TaskDefinition, TaskStatus,
     scheduler_grpc_client::SchedulerGrpcClient,
 };
-use ballista_core::serde::scheduler::{ExecutorSpecification, PartitionId};
+use ballista_core::serde::scheduler::{ExecutorSpecification, TaskKey};
 use datafusion::execution::context::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::AsLogicalPlan;
@@ -160,13 +160,10 @@ where
                             //
 
                             let task_index = task.task_index as usize;
-                            // TODO(c4a.2): PartitionId.partition_id is
-                            // semantically task_index here — replace with
-                            // TaskKey when it lands.
-                            let task_key = PartitionId {
+                            let task_key = TaskKey {
                                 job_id: task.job_id.clone().into(),
                                 stage_id: task.stage_id as usize,
-                                partition_id: task_index,
+                                task_index,
                             };
 
                             warn!(
@@ -284,9 +281,6 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             proto.try_into_physical_plan(&task_context, codec.physical_extension_codec())
         })?;
 
-    // TODO(c4a.2): create_query_stage_exec still takes partition_id
-    // (semantically task_index now under substrate) — TaskKey rework
-    // should update that receiver too.
     let query_stage_exec = executor.execution_engine.create_query_stage_exec(
         job_id.clone(),
         stage_id as usize,
@@ -297,18 +291,16 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     )?;
     dedicated_executor.spawn(async move {
         use std::panic::AssertUnwindSafe;
-        // TODO(c4a.2): PartitionId.partition_id is semantically task_index
-        // here — replace with TaskKey when it lands.
-        let part = PartitionId {
+        let key = TaskKey {
             job_id: job_id.clone(),
             stage_id: stage_id as usize,
-            partition_id: task_index as usize,
+            task_index: task_index as usize,
         };
 
         let task_start = Instant::now();
         let execution_result = match AssertUnwindSafe(executor.execute_query_stage(
             task_id as usize,
-            part.clone(),
+            key.clone(),
             query_stage_exec.clone(),
             task_context,
         ))
@@ -352,7 +344,7 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             executor.metadata.id.clone(),
             task_id as usize,
             stage_attempt_num as usize,
-            part,
+            key,
             operator_metrics,
             task_execution_times,
         ));

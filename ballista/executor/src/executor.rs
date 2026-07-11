@@ -31,7 +31,7 @@ use ballista_core::error::BallistaError;
 use ballista_core::registry::BallistaFunctionRegistry;
 use ballista_core::serde::protobuf;
 use ballista_core::serde::protobuf::ExecutorRegistration;
-use ballista_core::serde::scheduler::PartitionId;
+use ballista_core::serde::scheduler::TaskKey;
 use dashmap::DashMap;
 use datafusion::execution::context::TaskContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
@@ -66,7 +66,7 @@ impl Future for TasksDrainedFuture {
     }
 }
 
-type AbortHandles = Arc<DashMap<(usize, PartitionId), AbortHandle>>;
+type AbortHandles = Arc<DashMap<(usize, TaskKey), AbortHandle>>;
 
 /// Ballista executor
 #[derive(Clone)]
@@ -223,16 +223,16 @@ impl Executor {
     pub async fn execute_query_stage(
         &self,
         task_id: usize,
-        partition: PartitionId,
+        key: TaskKey,
         query_stage_exec: Arc<dyn QueryStageExecutor>,
         task_ctx: Arc<TaskContext>,
     ) -> Result<Vec<protobuf::ShuffleWritePartition>, BallistaError> {
         let (task, abort_handle) = futures::future::abortable(
-            query_stage_exec.execute_query_stage(partition.partition_id, task_ctx),
+            query_stage_exec.execute_query_stage(key.task_index, task_ctx),
         );
 
         self.abort_handles
-            .insert((task_id, partition.clone()), abort_handle);
+            .insert((task_id, key.clone()), abort_handle);
 
         let partitions = match std::panic::AssertUnwindSafe(task).catch_unwind().await {
             Ok(Ok(result)) => {
@@ -249,12 +249,12 @@ impl Executor {
             }
         };
 
-        self.abort_handles.remove(&(task_id, partition.clone()));
+        self.abort_handles.remove(&(task_id, key.clone()));
 
         self.metrics_collector.record_stage(
-            &partition.job_id,
-            partition.stage_id,
-            partition.partition_id,
+            &key.job_id,
+            key.stage_id,
+            key.task_index,
             query_stage_exec,
         );
 
@@ -269,14 +269,14 @@ impl Executor {
         task_id: usize,
         job_id: JobId,
         stage_id: usize,
-        partition_id: usize,
+        task_index: usize,
     ) -> Result<bool, BallistaError> {
         if let Some((_, handle)) = self.abort_handles.remove(&(
             task_id,
-            PartitionId {
+            TaskKey {
                 job_id,
                 stage_id,
-                partition_id,
+                task_index,
             },
         )) {
             handle.abort();
@@ -307,7 +307,7 @@ mod test {
     use ballista_core::RuntimeProducer;
     use ballista_core::execution_plans::ShuffleWriterExec;
     use ballista_core::serde::protobuf::ExecutorRegistration;
-    use ballista_core::serde::scheduler::PartitionId;
+    use ballista_core::serde::scheduler::TaskKey;
     use ballista_core::utils::default_config_producer;
     use datafusion::arrow::datatypes::{Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -461,13 +461,13 @@ mod test {
         // Spawn our non-terminating task on a separate fiber.
         let executor_clone = executor.clone();
         tokio::task::spawn(async move {
-            let part = PartitionId {
+            let key = TaskKey {
                 job_id: "job-id".into(),
                 stage_id: 1,
-                partition_id: 0,
+                task_index: 0,
             };
             let task_result = executor_clone
-                .execute_query_stage(1, part, Arc::new(query_stage_exec), ctx.task_ctx())
+                .execute_query_stage(1, key, Arc::new(query_stage_exec), ctx.task_ctx())
                 .await;
             sender.send(task_result).expect("sending result");
         });

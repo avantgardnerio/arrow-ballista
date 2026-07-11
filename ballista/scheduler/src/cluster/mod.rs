@@ -26,7 +26,7 @@ use ballista_core::error::Result;
 use ballista_core::serde::protobuf::{
     AvailableVcores, ExecutorHeartbeat, JobStatus, job_status,
 };
-use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata, PartitionId};
+use ballista_core::serde::scheduler::{ExecutorData, ExecutorMetadata, TaskKey};
 use ballista_core::utils::{default_config_producer, default_session_builder};
 use ballista_core::{ConfigProducer, JobId, JobStatusSubscriber};
 use datafusion::physical_plan::ExecutionPlan;
@@ -397,7 +397,7 @@ pub(crate) async fn bind_task_bias(
                 .filter(|(_partition, info)| info.is_none())
                 .take(total_vcores as usize)
                 .collect::<Vec<_>>();
-            for (partition_id, task_info) in runnable_tasks {
+            for (task_index, task_info) in runnable_tasks {
                 // Advance to a budget with free vcores.
                 while current.vcores == 0 {
                     idx += 1;
@@ -411,17 +411,17 @@ pub(crate) async fn bind_task_bias(
                 *task_id_gen += 1;
                 *task_info = Some(create_task_info(executor_id.clone(), task_id));
 
-                let partition = PartitionId {
+                let key = TaskKey {
                     job_id: job_id.clone(),
                     stage_id: running_stage.stage_id,
-                    partition_id,
+                    task_index,
                 };
                 let task_desc = TaskDescription {
                     session_id: session_id.clone(),
-                    partition,
+                    key,
                     stage_attempt_num: running_stage.stage_attempt_num,
                     task_id,
-                    task_attempt: running_stage.task_failure_numbers[partition_id],
+                    task_attempt: running_stage.task_failure_numbers[task_index],
                     plan: running_stage.plan.clone(),
                     session_config: running_stage.session_config.clone(),
                 };
@@ -481,7 +481,7 @@ pub(crate) async fn bind_task_round_robin(
                 .filter(|(_partition, info)| info.is_none())
                 .take(total_vcores as usize)
                 .collect::<Vec<_>>();
-            for (partition_id, task_info) in runnable_tasks {
+            for (task_index, task_info) in runnable_tasks {
                 // Wrap around and skip exhausted budgets.
                 if idx >= budgets.len() {
                     idx = 0;
@@ -497,17 +497,17 @@ pub(crate) async fn bind_task_round_robin(
                 *task_id_gen += 1;
                 *task_info = Some(create_task_info(executor_id.clone(), task_id));
 
-                let partition = PartitionId {
+                let key = TaskKey {
                     job_id: job_id.to_owned(),
                     stage_id: running_stage.stage_id,
-                    partition_id,
+                    task_index,
                 };
                 let task_desc = TaskDescription {
                     session_id: session_id.clone(),
-                    partition,
+                    key,
                     stage_attempt_num: running_stage.stage_attempt_num,
                     task_id,
-                    task_attempt: running_stage.task_failure_numbers[partition_id],
+                    task_attempt: running_stage.task_failure_numbers[task_index],
                     plan: running_stage.plan.clone(),
                     session_config: running_stage.session_config.clone(),
                 };
@@ -686,7 +686,7 @@ mod test {
 
         for bound_task in bound_tasks {
             let entry = result
-                .entry(bound_task.1.partition.job_id)
+                .entry(bound_task.1.key.job_id)
                 .or_insert_with(HashMap::new);
             let n = entry.entry(bound_task.0).or_insert_with(|| 0);
             *n += 1;

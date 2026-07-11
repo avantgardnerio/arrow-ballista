@@ -550,12 +550,10 @@ mod test {
                 // Complete the task
                 let task_status = TaskStatus {
                     task_id: task.task_id as u32,
-                    job_id: task.partition.job_id.clone().into(),
-                    stage_id: task.partition.stage_id as u32,
+                    job_id: task.key.job_id.clone().into(),
+                    stage_id: task.key.stage_id as u32,
                     stage_attempt_num: task.stage_attempt_num as u32,
-                    // TODO(c4a.2): RHS is TaskDescription.partition.partition_id,
-                    // semantically task_index — becomes TaskKey.task_index.
-                    task_index: task.partition.partition_id as u32,
+                    task_index: task.key.task_index as u32,
                     launch_time: 0,
                     start_exec_time: 0,
                     end_exec_time: 0,

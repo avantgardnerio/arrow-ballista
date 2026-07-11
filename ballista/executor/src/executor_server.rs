@@ -47,8 +47,8 @@ use ballista_core::serde::protobuf::{
     executor_metric, executor_status,
     scheduler_grpc_client::SchedulerGrpcClient,
 };
-use ballista_core::serde::scheduler::PartitionId;
 use ballista_core::serde::scheduler::TaskDefinition;
+use ballista_core::serde::scheduler::TaskKey;
 
 use ballista_core::serde::scheduler::from_proto::{
     get_task_definition, get_task_definition_vec,
@@ -371,16 +371,12 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         let task_index = task.task_index;
         let plan = task.plan;
 
-        // TODO(c4a.2): PartitionId here really identifies (job, stage, task
-        // slot), not (job, stage, partition). Replace with TaskKey.
-        let part = PartitionId {
+        let key = TaskKey {
             job_id: job_id.clone(),
             stage_id,
-            partition_id: task_index,
+            task_index,
         };
 
-        // TODO(c4a.2): create_query_stage_exec's third arg is named
-        // `partition` but is now task_index. TaskKey rework should update.
         let exec = self.executor.execution_engine.create_query_stage_exec(
             job_id.clone(),
             stage_id,
@@ -416,12 +412,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                 let task_start = Instant::now();
                 let execution_result = self
                     .executor
-                    .execute_query_stage(
-                        task_id,
-                        part.clone(),
-                        exec.clone(),
-                        task_context,
-                    )
+                    .execute_query_stage(task_id, key.clone(), exec.clone(), task_context)
                     .await;
                 info!(
                     "Finished task : [{task_identity}] in {:?}",
@@ -454,7 +445,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                     executor_id.clone(),
                     task_id,
                     stage_attempt_num,
-                    part,
+                    key.clone(),
                     operator_metrics,
                     task_execution_times,
                 );
@@ -479,7 +470,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
                     self.executor.metadata.id.clone(),
                     task_id,
                     stage_attempt_num,
-                    part,
+                    key.clone(),
                     None,
                     TaskExecutionTimes {
                         launch_time: task.launch_time,
@@ -925,8 +916,6 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorGrpc
                     task.task_id as usize,
                     task.job_id.into(),
                     task.stage_id as usize,
-                    // TODO(c4a.2): cancel_task's `partition_id` arg is
-                    // semantically task_index here.
                     task.task_index as usize,
                 )
                 .await

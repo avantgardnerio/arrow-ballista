@@ -961,9 +961,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                                 task_id,
                                 job_id: self.job_id.clone(),
                                 stage_id,
-                                // TODO(c4a.2): RunningTaskInfo.partition_id
-                                // (Rust) is semantically task_index — rename.
-                                partition_id: task_index,
+                                task_index,
                                 executor_id,
                             }
                         })
@@ -1119,9 +1117,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                         task_id,
                         job_id: self.job_id.clone(),
                         stage_id,
-                        // TODO(c4a.2): RunningTaskInfo.partition_id (Rust)
-                        // is semantically task_index — rename.
-                        partition_id: task_index,
+                        task_index,
                         executor_id,
                     },
                 )
@@ -1279,23 +1275,21 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
             }
         }).map(|(stage_id, stage)| {
             if let ExecutionStage::Running(stage) = stage {
-                use ballista_core::serde::scheduler::PartitionId;
+                use ballista_core::serde::scheduler::TaskKey;
 
                 let (task_index, _) = stage
                     .task_infos
                     .iter()
                     .enumerate()
-                    .find(|(_partition, info)| info.is_none())
+                    .find(|(_task_slot, info)| info.is_none())
                     .ok_or_else(|| {
                         BallistaError::Internal(format!("Error getting next task for job {job_id}: Stage {stage_id} is ready but has no pending tasks"))
                     })?;
 
-                // TODO(c4a.2): PartitionId here really identifies (job,
-                // stage, task slot). Replace with TaskKey.
-                let partition = PartitionId {
+                let key = TaskKey {
                     job_id,
                     stage_id: *stage_id,
-                    partition_id: task_index,
+                    task_index,
                 };
 
                 let task_id = next_task_id.unwrap();
@@ -1318,7 +1312,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
 
                 Ok(crate::state::execution_graph::TaskDescription {
                     session_id,
-                    partition,
+                    key,
                     stage_attempt_num: stage.stage_attempt_num,
                     task_id,
                     task_attempt,

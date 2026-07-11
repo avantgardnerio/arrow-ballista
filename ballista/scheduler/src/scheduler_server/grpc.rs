@@ -145,7 +145,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> SchedulerGrpc
 
             let mut tasks = vec![];
             for (_, task) in schedulable_tasks {
-                let job_id = task.partition.job_id.clone();
+                let job_id = task.key.job_id.clone();
                 match self.state.task_manager.prepare_task_definition(task) {
                     Ok(task_definition) => tasks.push(task_definition),
                     Err(e) => {

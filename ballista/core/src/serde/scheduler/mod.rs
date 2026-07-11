@@ -69,6 +69,23 @@ pub struct PartitionId {
     pub partition_id: usize,
 }
 
+/// Locator for a task within an execution graph: (job, stage, task slot).
+///
+/// Post-substrate one task processes a partition slice, so the third
+/// component is `task_index` (task slot within the stage), not a partition
+/// index. Sibling to [`PartitionId`] — [`PartitionId`] identifies an
+/// operator output partition (shuffle location, etc.), [`TaskKey`]
+/// identifies a scheduled task attempt.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskKey {
+    /// The job identifier.
+    pub job_id: JobId,
+    /// The stage identifier within the job.
+    pub stage_id: usize,
+    /// Task slot within the stage.
+    pub task_index: usize,
+}
+
 impl PartitionId {
     /// Creates a new partition ID with the given job, stage, and partition identifiers.
     pub fn new(job_id: &JobId, stage_id: usize, partition_id: usize) -> Self {
