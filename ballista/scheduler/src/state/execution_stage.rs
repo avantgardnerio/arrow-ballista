@@ -1054,10 +1054,10 @@ fn sum_leaf_scan_partitions(plan: &Arc<dyn ExecutionPlan>) -> usize {
     children.into_iter().map(sum_leaf_scan_partitions).sum()
 }
 
-/// TODO: read from ExecutorSpecification.task_slots via the cluster manager
-/// instead of hardcoding. This is placeholder for the substrate work — the
-/// number here should be "how many cores a single task can drive on one
-/// executor," which is what --concurrent-tasks controls today.
+/// TODO(c4): read from ExecutorSpecification.vcores via the cluster manager
+/// instead of hardcoding. Placeholder for per-exec heterogeneous packing —
+/// the number here should be "how many vcores a single task can drive on
+/// one executor," which is what `--vcores` controls today.
 const TODO_EXECUTOR_CORES: usize = 4;
 
 /// Get the number of task slots for a stage.

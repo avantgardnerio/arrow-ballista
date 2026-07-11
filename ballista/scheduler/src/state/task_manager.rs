@@ -145,25 +145,19 @@ pub struct TaskManager<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
 
 /// Cache for active job information managed by this scheduler.
 ///
-/// Cores per executor. Used as the chunk size when slicing the stage's
-/// partition space across tasks. TODO: read from `ExecutorSpecification.task_slots`
-/// via the cluster manager once the cluster-shape plumbing lands. Hardcoded
-/// 4 matches the `--concurrent-tasks 4` default and the mirror TODO in
-/// `execution_stage::get_stage_partitions`.
+/// Vcores per executor. Used as the chunk size when slicing the stage's
+/// partition space across tasks. TODO(c4): read from
+/// `ExecutorSpecification.vcores` via the cluster manager once per-exec
+/// heterogeneous packing lands. Hardcoded 4 matches the `--vcores 4` default
+/// and the mirror TODO in `execution_stage::get_stage_partitions`.
 ///
-/// TODO: rename `task_slots` → `num_proc` (or similar). Under the new model a
-/// task uses ALL of an executor's cores, so the field represents cores-per-
-/// executor, not "how many task instances can run concurrently." Renaming
-/// makes the semantic shift explicit and unblocks the assignment fix below.
-///
-/// TODO: assignment should give at most one task per executor at a time.
-/// Today the scheduler sees `task_slots=4` and packs up to 4 tasks into one
+/// TODO(c4): assignment should give at most one primary task per executor at
+/// a time (leftover-vcore packing may add a secondary task later). Today the
+/// scheduler still packs up to `AvailableVcores.vcores` tasks into one
 /// executor before touching the next — which is why both stage-0 tasks land
 /// on exec0 while exec1 sits idle. Fix belongs in
-/// `cluster::memory::AvailableTaskSlots` (or wherever slot bookkeeping lives)
-/// after the rename above: an executor advertises 1 slot to the scheduler,
-/// and the "run this many partitions in parallel inside the task" side is
-/// governed by cores-per-exec.
+/// `cluster::memory::InMemoryClusterState::available_vcores` / the bind
+/// helpers in `cluster/mod.rs`.
 const TODO_EXECUTOR_CORES: usize = 4;
 
 /// Compute the partition slice for a task given its slot index within the
