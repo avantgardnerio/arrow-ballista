@@ -290,13 +290,10 @@ pub async fn start_executor_process(
     );
     info!("Executor id: {executor_id}");
     info!("Executor working directory: {work_dir}");
-    info!(
-        "Executor number of concurrent tasks (available CPU cores): {vcores}"
-    );
+    info!("Executor number of concurrent tasks (available CPU cores): {vcores}");
     info!("Executor scheduling policy: {task_scheduling_policy:?}");
 
-    let executor_meta =
-        structure_executor_metadata(&executor_id, &opt, vcores as u32);
+    let executor_meta = structure_executor_metadata(&executor_id, &opt, vcores as u32);
 
     // put them to session config
     let metrics_collector = Arc::new(LoggingMetricsCollector::default());

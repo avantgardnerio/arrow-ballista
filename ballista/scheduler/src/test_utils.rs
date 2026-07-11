@@ -842,11 +842,7 @@ pub fn revive_graph_and_complete_next_stage_with_executor(
         .values()
         .map(|stage| {
             if let ExecutionStage::Running(stage) = stage {
-                stage
-                    .task_infos
-                    .iter()
-                    .filter(|info| info.is_none())
-                    .count()
+                stage.available_tasks()
             } else {
                 0
             }

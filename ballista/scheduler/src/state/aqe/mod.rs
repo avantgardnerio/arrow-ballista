@@ -666,7 +666,9 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                             task_index
                         );
 
-                        if !running_stage.update_task_info(task_index, &task_status) {
+                        if !running_stage
+                            .update_task_info(task_index, task_status.clone())
+                        {
                             continue;
                         }
 
@@ -1277,23 +1279,21 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
             if let ExecutionStage::Running(stage) = stage {
                 use ballista_core::serde::scheduler::TaskKey;
 
-                let (task_index, _) = stage
-                    .task_infos
-                    .iter()
-                    .enumerate()
-                    .find(|(_task_slot, info)| info.is_none())
-                    .ok_or_else(|| {
-                        BallistaError::Internal(format!("Error getting next task for job {job_id}: Stage {stage_id} is ready but has no pending tasks"))
-                    })?;
-
-                let key = TaskKey {
-                    job_id,
-                    stage_id: *stage_id,
-                    task_index,
-                };
-
+                // pop_next_task hands out a single-partition slice — the
+                // bind path sized to `exec.vcores` lives in cluster/mod.rs.
+                let slice = stage.pending.next_slice(1);
+                if slice.is_empty() {
+                    return Err(BallistaError::Internal(format!(
+                        "Error getting next task for job {job_id}: Stage {stage_id} is ready but has no pending tasks"
+                    )));
+                }
+                let task_index = stage.task_infos.len();
                 let task_id = next_task_id.unwrap();
-                let task_attempt = stage.task_failure_numbers[task_index];
+                let task_attempt = slice
+                    .iter()
+                    .map(|p| stage.task_failure_numbers[*p])
+                    .max()
+                    .unwrap_or(0);
                 let task_info = crate::state::execution_graph::TaskInfo {
                     task_id,
                     scheduled_time: timestamp_millis() as u128,
@@ -1305,10 +1305,15 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                     task_status: task_status::Status::Running(ballista_core::serde::protobuf::RunningTask {
                         executor_id: executor_id.to_owned()
                     }),
+                    partition_slice: slice.clone(),
                 };
+                stage.task_infos.push(task_info);
 
-                // Set the task info to Running for new task
-                stage.task_infos[task_index] = Some(task_info);
+                let key = TaskKey {
+                    job_id,
+                    stage_id: *stage_id,
+                    task_index,
+                };
 
                 Ok(crate::state::execution_graph::TaskDescription {
                     session_id,
@@ -1316,6 +1321,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                     stage_attempt_num: stage.stage_attempt_num,
                     task_id,
                     task_attempt,
+                    partition_slice: slice,
                     plan: stage.plan.clone(),
                     session_config: self.session_config.clone()
                 })

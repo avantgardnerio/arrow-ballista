@@ -810,7 +810,9 @@ impl ExecutionGraph for StaticExecutionGraph {
                             task_stage_attempt_num,
                             partition_id
                         );
-                        if !running_stage.update_task_info(partition_id, &task_status) {
+                        if !running_stage
+                            .update_task_info(partition_id, task_status.clone())
+                        {
                             continue;
                         }
 
@@ -1475,23 +1477,21 @@ impl ExecutionGraph for StaticExecutionGraph {
             }
         }).map(|(stage_id, stage)| {
             if let ExecutionStage::Running(stage) = stage {
-                let (task_index, _) = stage
-                    .task_infos
-                    .iter()
-                    .enumerate()
-                    .find(|(_task_slot, info)| info.is_none())
-                    .ok_or_else(|| {
-                        BallistaError::Internal(format!("Error getting next task for job {job_id}: Stage {stage_id} is ready but has no pending tasks"))
-                    })?;
-
-                let key = TaskKey {
-                    job_id,
-                    stage_id: *stage_id,
-                    task_index,
-                };
-
+                // pop_next_task hands out a single-partition slice — bind path
+                // sized to `exec.vcores` lives in `cluster::bind_task_*`.
+                let slice = stage.pending.next_slice(1);
+                if slice.is_empty() {
+                    return Err(BallistaError::Internal(format!(
+                        "Error getting next task for job {job_id}: Stage {stage_id} is ready but has no pending tasks"
+                    )));
+                }
+                let task_index = stage.task_infos.len();
                 let task_id = next_task_id.unwrap();
-                let task_attempt = stage.task_failure_numbers[task_index];
+                let task_attempt = slice
+                    .iter()
+                    .map(|p| stage.task_failure_numbers[*p])
+                    .max()
+                    .unwrap_or(0);
                 let task_info = TaskInfo {
                     task_id,
                     scheduled_time: SystemTime::now()
@@ -1506,10 +1506,15 @@ impl ExecutionGraph for StaticExecutionGraph {
                     task_status: task_status::Status::Running(RunningTask {
                         executor_id: executor_id.to_owned()
                     }),
+                    partition_slice: slice.clone(),
                 };
+                stage.task_infos.push(task_info);
 
-                // Set the task info to Running for new task
-                stage.task_infos[task_index] = Some(task_info);
+                let key = TaskKey {
+                    job_id,
+                    stage_id: *stage_id,
+                    task_index,
+                };
 
                 Ok(TaskDescription {
                     session_id,
@@ -1517,6 +1522,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                     stage_attempt_num: stage.stage_attempt_num,
                     task_id,
                     task_attempt,
+                    partition_slice: slice,
                     plan: stage.plan.clone(),
                     session_config: self.session_config.clone()
                 })
@@ -1559,7 +1565,9 @@ impl Debug for StaticExecutionGraph {
     }
 }
 
-/// Creates a new `TaskInfo` for a task that is about to be scheduled on an executor.
+/// Creates a new `TaskInfo` for a task that is about to be scheduled on an
+/// executor. The caller sets `partition_slice` to the partitions this task
+/// will process (bind loops draw the slice from `stage.pending`).
 pub fn create_task_info(executor_id: String, task_id: usize) -> TaskInfo {
     TaskInfo {
         task_id,
@@ -1567,12 +1575,12 @@ pub fn create_task_info(executor_id: String, task_id: usize) -> TaskInfo {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis(),
-        // Those times will be updated when the task finish
         launch_time: 0,
         start_exec_time: 0,
         end_exec_time: 0,
         finish_time: 0,
         task_status: task_status::Status::Running(RunningTask { executor_id }),
+        partition_slice: vec![],
     }
 }
 
@@ -1702,6 +1710,11 @@ pub struct TaskDescription {
     pub task_id: usize,
     /// The attempt number for this specific task (for retry tracking).
     pub task_attempt: usize,
+    /// The partitions (real plan input indices) this task will process.
+    /// Populated at bind time from the stage's `PendingPartitions` cursor
+    /// sized to the assigned executor's free vcores. Baked into `plan`
+    /// via `task_builder::restrict_plan_to_partitions` before dispatch.
+    pub partition_slice: Vec<usize>,
     /// The physical execution plan to run for this task.
     pub plan: Arc<dyn ExecutionPlan>,
     /// Session configuration for this task's execution context.
@@ -2247,17 +2260,15 @@ mod test {
 
         // In-flight tasks of the cancelled stage are recorded as Failed(TaskKilled)
         let has_killed_task = graph.stages.values().any(|stage| match stage {
-            ExecutionStage::Failed(failed) => {
-                failed.task_infos.iter().flatten().any(|info| {
-                    matches!(
-                        &info.task_status,
-                        task_status::Status::Failed(FailedTask {
-                            failed_reason: Some(failed_task::FailedReason::TaskKilled(_)),
-                            ..
-                        })
-                    )
-                })
-            }
+            ExecutionStage::Failed(failed) => failed.task_infos.iter().any(|info| {
+                matches!(
+                    &info.task_status,
+                    task_status::Status::Failed(FailedTask {
+                        failed_reason: Some(failed_task::FailedReason::TaskKilled(_)),
+                        ..
+                    })
+                )
+            }),
             _ => false,
         });
         assert!(

@@ -143,33 +143,6 @@ pub struct TaskManager<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan>
     stage_max_failures: usize,
 }
 
-/// Cache for active job information managed by this scheduler.
-///
-/// Vcores per executor. Used as the chunk size when slicing the stage's
-/// partition space across tasks. TODO(c4): read from
-/// `ExecutorSpecification.vcores` via the cluster manager once per-exec
-/// heterogeneous packing lands. Hardcoded 4 matches the `--vcores 4` default
-/// and the mirror TODO in `execution_stage::get_stage_partitions`.
-///
-/// TODO(c4): assignment should give at most one primary task per executor at
-/// a time (leftover-vcore packing may add a secondary task later). Today the
-/// scheduler still packs up to `AvailableVcores.vcores` tasks into one
-/// executor before touching the next — which is why both stage-0 tasks land
-/// on exec0 while exec1 sits idle. Fix belongs in
-/// `cluster::memory::InMemoryClusterState::available_vcores` / the bind
-/// helpers in `cluster/mod.rs`.
-const TODO_EXECUTOR_CORES: usize = 4;
-
-/// Compute the partition slice for a task given its slot index within the
-/// stage. Task `slot` owns partitions `[slot * cores .. (slot + 1) * cores)`.
-/// The rewriter tolerates indices past the leaf's actual partition count
-/// (they become empty file groups or dropped shuffle-reader entries).
-// TODO: don't tollerate indices past the leaf's actual partition count
-fn task_partition_slice(slot: usize) -> Vec<usize> {
-    let start = slot * TODO_EXECUTOR_CORES;
-    (start..start + TODO_EXECUTOR_CORES).collect()
-}
-
 /// Contains the execution graph and cached data to improve performance
 /// when scheduling tasks for the job.
 #[derive(Clone)]
@@ -733,8 +706,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         let stage_id = task.key.stage_id;
 
         if self.active_job_cache.get(&job_id).is_some() {
-            let slice = task_partition_slice(task.key.task_index);
-            let restricted = restrict_plan_to_partitions(task.plan.clone(), &slice)?;
+            let restricted =
+                restrict_plan_to_partitions(task.plan.clone(), &task.partition_slice)?;
             let mut plan_buf: Vec<u8> = vec![];
             let plan_proto = PhysicalPlanNode::try_from_physical_plan(
                 restricted,
@@ -830,8 +803,8 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
         let mut multi_tasks = Vec::with_capacity(tasks.len());
         for task in tasks {
-            let slice = task_partition_slice(task.key.task_index);
-            let restricted = restrict_plan_to_partitions(task.plan.clone(), &slice)?;
+            let restricted =
+                restrict_plan_to_partitions(task.plan.clone(), &task.partition_slice)?;
             let mut plan_buf: Vec<u8> = vec![];
             let plan_proto = PhysicalPlanNode::try_from_physical_plan(restricted, codec)?;
             plan_proto.try_encode(&mut plan_buf)?;
@@ -939,4 +912,3 @@ impl From<&ExecutionGraphBox> for JobOverview {
         }
     }
 }
-

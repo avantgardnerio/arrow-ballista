@@ -351,6 +351,52 @@ pub trait JobState: Send + Sync {
     fn produce_config(&self) -> SessionConfig;
 }
 
+/// Bind a task to an executor: draw a partition slice sized to that
+/// executor's free vcores, append the resulting `TaskInfo` to the stage,
+/// and produce a `TaskDescription` for dispatch. Consumes the executor's
+/// remaining vcore budget entirely — leftover packing is c5, deferred.
+fn bind_one(
+    running_stage: &mut crate::state::execution_stage::RunningStage,
+    task_id_gen: &mut usize,
+    session_id: &str,
+    job_id: &JobId,
+    budget: &mut AvailableVcores,
+) -> Option<BoundTask> {
+    let slice = running_stage.pending.next_slice(budget.vcores as usize);
+    if slice.is_empty() {
+        return None;
+    }
+    let executor_id = budget.executor_id.clone();
+    let task_id = *task_id_gen;
+    *task_id_gen += 1;
+    let task_index = running_stage.task_infos.len();
+    let task_attempt = slice
+        .iter()
+        .map(|p| running_stage.task_failure_numbers[*p])
+        .max()
+        .unwrap_or(0);
+    let mut task_info = create_task_info(executor_id.clone(), task_id);
+    task_info.partition_slice = slice.clone();
+    running_stage.task_infos.push(task_info);
+    let key = TaskKey {
+        job_id: job_id.clone(),
+        stage_id: running_stage.stage_id,
+        task_index,
+    };
+    let task_desc = TaskDescription {
+        session_id: session_id.to_string(),
+        key,
+        stage_attempt_num: running_stage.stage_attempt_num,
+        task_id,
+        task_attempt,
+        partition_slice: slice,
+        plan: running_stage.plan.clone(),
+        session_config: running_stage.session_config.clone(),
+    };
+    budget.vcores = 0;
+    Some((executor_id, task_desc))
+}
+
 pub(crate) async fn bind_task_bias(
     mut budgets: Vec<&mut AvailableVcores>,
     running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
@@ -358,17 +404,17 @@ pub(crate) async fn bind_task_bias(
 ) -> Vec<BoundTask> {
     let mut schedulable_tasks: Vec<BoundTask> = vec![];
 
-    let total_vcores = budgets.iter().fold(0, |acc, b| acc + b.vcores);
-    if total_vcores == 0 {
+    if budgets.iter().all(|b| b.vcores == 0) {
         debug!("No executor vcores available for task binding");
         return schedulable_tasks;
     }
 
-    // Sort budgets by free-vcore count, descending.
+    // Bias: give each stage the biggest exec available. Sort descending;
+    // a task consumes an exec's full vcore budget (c5-deferred: no
+    // leftover packing).
     budgets.sort_by(|a, b| Ord::cmp(&b.vcores, &a.vcores));
 
     let mut idx = 0usize;
-    let mut current = &mut budgets[idx];
     for (job_id, job_info) in running_jobs.iter() {
         if !matches!(job_info.status, Some(job_status::Status::Running(_))) {
             debug!("Job {job_id} is not in running status and will be skipped");
@@ -388,46 +434,23 @@ pub(crate) async fn bind_task_bias(
                 black_list.push(running_stage.stage_id);
                 continue;
             }
-            // We are sure that it will at least bind one task by going through the following logic.
-            // It will not go into a dead loop.
-            let runnable_tasks = running_stage
-                .task_infos
-                .iter_mut()
-                .enumerate()
-                .filter(|(_partition, info)| info.is_none())
-                .take(total_vcores as usize)
-                .collect::<Vec<_>>();
-            for (task_index, task_info) in runnable_tasks {
-                // Advance to a budget with free vcores.
-                while current.vcores == 0 {
+            while idx < budgets.len() {
+                while idx < budgets.len() && budgets[idx].vcores == 0 {
                     idx += 1;
-                    if idx >= budgets.len() {
-                        return schedulable_tasks;
-                    }
-                    current = &mut budgets[idx];
                 }
-                let executor_id = current.executor_id.clone();
-                let task_id = *task_id_gen;
-                *task_id_gen += 1;
-                *task_info = Some(create_task_info(executor_id.clone(), task_id));
-
-                let key = TaskKey {
-                    job_id: job_id.clone(),
-                    stage_id: running_stage.stage_id,
-                    task_index,
-                };
-                let task_desc = TaskDescription {
-                    session_id: session_id.clone(),
-                    key,
-                    stage_attempt_num: running_stage.stage_attempt_num,
-                    task_id,
-                    task_attempt: running_stage.task_failure_numbers[task_index],
-                    plan: running_stage.plan.clone(),
-                    session_config: running_stage.session_config.clone(),
-                };
-                schedulable_tasks.push((executor_id, task_desc));
-
-                current.vcores -= 1;
+                if idx >= budgets.len() {
+                    return schedulable_tasks;
+                }
+                match bind_one(
+                    running_stage,
+                    task_id_gen,
+                    &session_id,
+                    job_id,
+                    &mut *budgets[idx],
+                ) {
+                    Some(bound) => schedulable_tasks.push(bound),
+                    None => break, // stage's pending is drained
+                }
             }
         }
     }
@@ -442,14 +465,14 @@ pub(crate) async fn bind_task_round_robin(
 ) -> Vec<BoundTask> {
     let mut schedulable_tasks: Vec<BoundTask> = vec![];
 
-    let mut total_vcores = budgets.iter().fold(0, |acc, b| acc + b.vcores);
-    if total_vcores == 0 {
+    if budgets.iter().all(|b| b.vcores == 0) {
         debug!("No executor vcores available for task binding");
         return schedulable_tasks;
     }
-    debug!("Total free vcores: {total_vcores}");
 
-    // Sort budgets by free-vcore count, descending.
+    // Round-robin across execs so multiple running stages each get one
+    // exec per rotation. Order by vcores desc so the largest exec goes
+    // first in the rotation.
     budgets.sort_by(|a, b| Ord::cmp(&b.vcores, &a.vcores));
 
     let mut idx = 0usize;
@@ -472,52 +495,27 @@ pub(crate) async fn bind_task_round_robin(
                 black_list.push(running_stage.stage_id);
                 continue;
             }
-            // We are sure that it will at least bind one task by going through the following logic.
-            // It will not go into a dead loop.
-            let runnable_tasks = running_stage
-                .task_infos
-                .iter_mut()
-                .enumerate()
-                .filter(|(_partition, info)| info.is_none())
-                .take(total_vcores as usize)
-                .collect::<Vec<_>>();
-            for (task_index, task_info) in runnable_tasks {
-                // Wrap around and skip exhausted budgets.
-                if idx >= budgets.len() {
-                    idx = 0;
+            loop {
+                let mut scanned = 0usize;
+                while budgets[idx].vcores == 0 {
+                    idx = (idx + 1) % budgets.len();
+                    scanned += 1;
+                    if scanned >= budgets.len() {
+                        return schedulable_tasks;
+                    }
                 }
-                if budgets[idx].vcores == 0 {
-                    idx = 0;
-                }
-                // Budgets are sorted descending and total_vcores > 0, so
-                // budgets[idx].vcores is guaranteed > 0 here.
-                let current = &mut budgets[idx];
-                let executor_id = current.executor_id.clone();
-                let task_id = *task_id_gen;
-                *task_id_gen += 1;
-                *task_info = Some(create_task_info(executor_id.clone(), task_id));
-
-                let key = TaskKey {
-                    job_id: job_id.to_owned(),
-                    stage_id: running_stage.stage_id,
-                    task_index,
-                };
-                let task_desc = TaskDescription {
-                    session_id: session_id.clone(),
-                    key,
-                    stage_attempt_num: running_stage.stage_attempt_num,
-                    task_id,
-                    task_attempt: running_stage.task_failure_numbers[task_index],
-                    plan: running_stage.plan.clone(),
-                    session_config: running_stage.session_config.clone(),
-                };
-                schedulable_tasks.push((executor_id, task_desc));
-
-                idx += 1;
-                current.vcores -= 1;
-                total_vcores -= 1;
-                if total_vcores == 0 {
-                    return schedulable_tasks;
+                match bind_one(
+                    running_stage,
+                    task_id_gen,
+                    &session_id,
+                    job_id,
+                    &mut *budgets[idx],
+                ) {
+                    Some(bound) => {
+                        schedulable_tasks.push(bound);
+                        idx = (idx + 1) % budgets.len();
+                    }
+                    None => break, // stage's pending is drained
                 }
             }
         }
