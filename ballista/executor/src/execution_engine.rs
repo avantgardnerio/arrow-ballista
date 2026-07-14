@@ -58,6 +58,7 @@ pub trait ExecutionEngine: Sync + Send {
         job_id: JobId,
         stage_id: usize,
         task_index: usize,
+        partition_slice: Vec<usize>,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
         config: &SessionConfig,
@@ -114,6 +115,7 @@ impl ExecutionEngine for DefaultExecutionEngine {
         job_id: JobId,
         stage_id: usize,
         task_index: usize,
+        partition_slice: Vec<usize>,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
         _config: &SessionConfig,
@@ -132,10 +134,13 @@ impl ExecutionEngine for DefaultExecutionEngine {
                         ))),
                     }
                 } else {
-                    // Scan restriction moved scheduler-side (see
+                    // Scan restriction is scheduler-side (see
                     // ballista/scheduler/src/state/task_builder.rs). The plan
-                    // arriving here already has its file_groups restricted to
-                    // this task's assigned slice.
+                    // arriving here is shrink-restricted to slice.len()
+                    // partitions; the writer walks its child plan to attach
+                    // global identity, using `partition_slice` for the
+                    // pass-through case and detecting plan-level partitioning
+                    // resets (SPM, RepartitionExec::Hash) for the rest.
                     Ok(Transformed::no(p))
                 }
             })?
@@ -144,8 +149,6 @@ impl ExecutionEngine for DefaultExecutionEngine {
         // the query plan created by the scheduler always starts with a shuffle writer
         // (either ShuffleWriterExec or SortShuffleWriterExec)
         if let Some(shuffle_writer) = plan.downcast_ref::<ShuffleWriterExec>() {
-            // Recreate the shuffle writer with the correct working directory
-            // and task-slot binding (file_id namespacing).
             let exec = ShuffleWriterExec::try_new(
                 job_id,
                 stage_id,
@@ -153,14 +156,14 @@ impl ExecutionEngine for DefaultExecutionEngine {
                 work_dir.to_string(),
                 shuffle_writer.shuffle_output_partitioning().cloned(),
             )?
-            .with_task_slot(task_index);
+            .with_task_index(task_index)
+            .with_partition_slice(partition_slice);
             Ok(Arc::new(DefaultQueryStageExec::new(
                 ShuffleWriterVariant::Hash(exec),
             )))
         } else if let Some(sort_shuffle_writer) =
             plan.downcast_ref::<SortShuffleWriterExec>()
         {
-            // recreate the sort shuffle writer with the correct working directory
             let exec = SortShuffleWriterExec::try_new(
                 job_id,
                 stage_id,
@@ -168,7 +171,9 @@ impl ExecutionEngine for DefaultExecutionEngine {
                 work_dir.to_string(),
                 sort_shuffle_writer.shuffle_output_partitioning().clone(),
                 sort_shuffle_writer.config().clone(),
-            )?;
+            )?
+            .with_task_index(task_index)
+            .with_partition_slice(partition_slice);
             Ok(Arc::new(DefaultQueryStageExec::new(
                 ShuffleWriterVariant::Sort(exec),
             )))
@@ -249,30 +254,22 @@ impl QueryStageExecutor for DefaultQueryStageExec {
         task_index: usize,
         context: Arc<TaskContext>,
     ) -> Result<Vec<ShuffleWritePartition>> {
-        let plan_arc: Arc<dyn ExecutionPlan> = match &self.shuffle_writer {
-            ShuffleWriterVariant::Hash(writer) => Arc::new(writer.clone()),
-            ShuffleWriterVariant::Sort(writer) => Arc::new(writer.clone()),
-        };
+        let (plan_arc, is_sort_shuffle): (Arc<dyn ExecutionPlan>, bool) =
+            match &self.shuffle_writer {
+                ShuffleWriterVariant::Hash(writer) => (Arc::new(writer.clone()), false),
+                ShuffleWriterVariant::Sort(writer) => (Arc::new(writer.clone()), true),
+            };
         info!(
             "executor plan pre-run (task_index={task_index}):\n{}",
             DisplayableExecutionPlan::new(plan_arc.as_ref()).indent(true)
         );
 
-        // SortShuffleWriter keeps its custom single-call entry point until
-        // it's ported to the DF-contract per-partition model.
-        let result = if let ShuffleWriterVariant::Sort(writer) = &self.shuffle_writer {
-            writer
-                .clone()
-                .execute_shuffle_write(task_index, context)
-                .await
-        } else {
-            // Hash-variant is a ShuffleWriterExec: drive it via K parallel
-            // `plan.execute(N, ctx)` calls so the writer's internal
-            // coordinator sees all K oneshot receivers taken concurrently
-            // and each output partition's summary is picked up as soon as
-            // its file is closed.
-            drive_shuffle_writer_stage(plan_arc.clone(), context).await
-        };
+        // Both variants share the same coordinator+oneshot handoff shape via
+        // `execute(N)` — drive K parallel calls so every oneshot receiver is
+        // taken concurrently and each output partition's summaries flow out
+        // as soon as its files are closed.
+        let result =
+            drive_shuffle_writer_stage(plan_arc.clone(), context, is_sort_shuffle).await;
 
         info!(
             "executor plan post-run (task_index={task_index}, ok={}):\n{}",
@@ -290,13 +287,19 @@ impl QueryStageExecutor for DefaultQueryStageExec {
     }
 }
 
-/// Spawn K parallel `plan.execute(N, ctx)` calls against a ShuffleWriterExec,
-/// collect the single-row metadata batch from each, and turn them back into
+/// Spawn K parallel `plan.execute(N, ctx)` calls against a shuffle writer,
+/// collect metadata batches from each, and turn them back into
 /// `Vec<ShuffleWritePartition>`. All K streams must be driven concurrently
 /// so the writer's internal coordinator sees every oneshot receiver taken.
+///
+/// `is_sort_shuffle` is stamped onto every summary produced from the batches
+/// — the metadata schema doesn't carry the flag (it's a handoff-only shape),
+/// but the reader side needs it in `PartitionLocation` to pick the right
+/// on-disk layout. The caller knows the variant from `ShuffleWriterVariant`.
 async fn drive_shuffle_writer_stage(
     plan: Arc<dyn ExecutionPlan>,
     context: Arc<TaskContext>,
+    is_sort_shuffle: bool,
 ) -> Result<Vec<ShuffleWritePartition>> {
     let k = plan.properties().output_partitioning().partition_count();
 
@@ -310,7 +313,7 @@ async fn drive_shuffle_writer_stage(
             while let Some(batch) = stream.try_next().await? {
                 batches.push(batch);
             }
-            metadata_batches_to_summaries(batches)
+            metadata_batches_to_summaries(batches, is_sort_shuffle)
         }));
     }
 
@@ -321,10 +324,10 @@ async fn drive_shuffle_writer_stage(
         })??;
         summaries.extend(per_partition);
     }
-    // Drop summaries for partitions that never had a file written. The
-    // writer's coordinator fills those slots with a zero-content sentinel
-    // (num_bytes=0) so `execute(N)` doesn't stall on an unfilled oneshot,
-    // but the scheduler must not try to fetch files that don't exist.
+    // Drop summaries for output slots that produced no data. The coordinator
+    // uses zero-content entries as sentinels so `execute(N)` streams don't
+    // stall on an unfilled oneshot; those must not become PartitionLocations
+    // the scheduler tries to fetch.
     summaries.retain(|s| s.num_bytes > 0);
     Ok(summaries)
 }
@@ -333,6 +336,7 @@ async fn drive_shuffle_writer_stage(
 /// with a single row) back into `ShuffleWritePartition` summaries.
 fn metadata_batches_to_summaries(
     batches: Vec<datafusion::arrow::record_batch::RecordBatch>,
+    is_sort_shuffle: bool,
 ) -> Result<Vec<ShuffleWritePartition>> {
     let stats_fields = PartitionStats::default().arrow_struct_fields();
     let num_rows_idx = stats_fields
@@ -426,7 +430,7 @@ fn metadata_batches_to_summaries(
                 num_rows: num_rows_arr.value(row),
                 num_bytes: num_bytes_arr.value(row),
                 file_id,
-                is_sort_shuffle: false,
+                is_sort_shuffle,
             });
         }
     }

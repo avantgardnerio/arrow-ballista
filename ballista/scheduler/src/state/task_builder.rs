@@ -64,55 +64,55 @@ pub fn restrict_plan_to_partitions(
     Ok(out.data)
 }
 
-/// Restrict a `DataSourceExec` (file-backed) so only the `partitions` file
-/// groups are populated; the rest become empty groups. Partition count is
-/// preserved so downstream operators keep the same output_partitioning shape.
-///
-/// TODO: collapse `file_groups` to just the populated ones so
-/// `output_partitioning` shrinks to `partitions.len()`. Today the plan lies —
-/// it reports 8 partitions when only 4 have data, so DataFusion spawns 4
-/// empty scatter subtasks per task and does 4 empty passes through the DRR
-/// chain. Same shape as `restrict_shuffle_reader` already does. Keeping
-/// partition count constant was a conservative first pass; nothing downstream
-/// depends on the pre-restrict count (DRR's K is set independently by the
-/// detection rule).
+/// Restrict a `DataSourceExec` (file-backed or in-memory) so only the
+/// assigned `partitions` remain. `output_partitioning().partition_count()`
+/// shrinks to `partitions.len()` — matching what `restrict_shuffle_reader`
+/// already does — so position `i` in the restricted plan corresponds to the
+/// task's `partition_slice[i]` globally.
 fn restrict_scan(
     plan: &Arc<dyn ExecutionPlan>,
     partitions: &[usize],
 ) -> Option<Arc<dyn ExecutionPlan>> {
     let exec = plan.downcast_ref::<DataSourceExec>()?;
     let source: &dyn Any = exec.data_source().as_ref();
-    let Some(config) = source.downcast_ref::<FileScanConfig>() else {
-        if source.downcast_ref::<MemorySourceConfig>().is_none() {
-            warn!(
-                "restrict_plan_to_partitions: unrecognised DataSourceExec source \
-                 left unrestricted; if it distributes work from a shared queue, \
-                 tasks would over-read"
-            );
-        }
-        return None;
-    };
-    let keep: std::collections::HashSet<usize> = partitions.iter().copied().collect();
-    let file_groups: Vec<FileGroup> = config
-        .file_groups
-        .iter()
-        .enumerate()
-        .map(|(i, group)| {
-            if keep.contains(&i) {
-                group.clone()
-            } else {
-                FileGroup::new(vec![])
-            }
-        })
-        .collect();
-    let config = FileScanConfigBuilder::from(config.clone())
-        .with_file_groups(file_groups)
-        .build();
-    Some(DataSourceExec::from_data_source(config))
+    if let Some(config) = source.downcast_ref::<FileScanConfig>() {
+        let file_groups: Vec<FileGroup> = partitions
+            .iter()
+            .filter_map(|&i| config.file_groups.get(i).cloned())
+            .collect();
+        let restricted = FileScanConfigBuilder::from(config.clone())
+            .with_file_groups(file_groups)
+            .build();
+        return Some(DataSourceExec::from_data_source(restricted));
+    }
+    if let Some(config) = source.downcast_ref::<MemorySourceConfig>() {
+        let kept: Vec<Vec<_>> = partitions
+            .iter()
+            .filter_map(|&i| config.partitions().get(i).cloned())
+            .collect();
+        let restricted = MemorySourceConfig::try_new(
+            &kept,
+            config.original_schema(),
+            config.projection().clone(),
+        )
+        .ok()?;
+        return Some(DataSourceExec::from_data_source(restricted));
+    }
+    warn!(
+        "restrict_plan_to_partitions: unrecognised DataSourceExec source \
+         left unrestricted; if it distributes work from a shared queue, \
+         tasks would over-read"
+    );
+    None
 }
 
 /// Restrict a `ShuffleReaderExec` so only the assigned `partitions` remain in
-/// its `partition` vec. Output_partitioning shrinks to `partitions.len()`.
+/// its `partition` vec. Output_partitioning shrinks to `partitions.len()` but
+/// **preserves the partitioning kind** — a `Hash([col], N)` reader becomes
+/// `Hash([col], kept.len())`, not `UnknownPartitioning`. This matters for
+/// operators like `InterleaveExec` above the reader that assert children
+/// share a hash partitioning to fuse safely; downgrading to
+/// `UnknownPartitioning` breaks that assertion.
 fn restrict_shuffle_reader(
     plan: &Arc<dyn ExecutionPlan>,
     partitions: &[usize],
@@ -127,8 +127,17 @@ fn restrict_shuffle_reader(
         .iter()
         .filter_map(|&p| reader.partition.get(p).cloned())
         .collect();
-    let partitioning =
-        datafusion::physical_plan::Partitioning::UnknownPartitioning(kept.len());
+    let partitioning = match reader.properties().output_partitioning() {
+        datafusion::physical_plan::Partitioning::Hash(exprs, _) => {
+            datafusion::physical_plan::Partitioning::Hash(exprs.clone(), kept.len())
+        }
+        datafusion::physical_plan::Partitioning::RoundRobinBatch(_) => {
+            datafusion::physical_plan::Partitioning::RoundRobinBatch(kept.len())
+        }
+        datafusion::physical_plan::Partitioning::UnknownPartitioning(_) => {
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(kept.len())
+        }
+    };
     let restricted =
         ShuffleReaderExec::try_new(reader.stage_id, kept, reader.schema(), partitioning)
             .ok()?;

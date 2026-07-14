@@ -492,12 +492,15 @@ pub struct TaskDefinition {
     pub stage_id: usize,
     /// Current attempt number for the stage.
     pub stage_attempt_num: usize,
-    /// Task slot within the stage. Post-substrate one task processes a
-    /// slice of partitions, so this is not a partition index — it identifies
-    /// the task among the stage's tasks. The actual partition slice is
-    /// baked into `plan` (Scan file_groups / ShuffleReader partitions
-    /// restricted at dispatch).
+    /// Monotonic index of this task within the stage. Not a partition index —
+    /// one task processes a slice of partitions given by `partition_slice`.
     pub task_index: usize,
+    /// Global partition ids this task's restricted plan covers, in slice
+    /// order. `plan.output_partitioning().partition_count() == partition_slice.len()`
+    /// for pass-through shapes; writers use the slice to attach global
+    /// identity to shuffle files (with special-casing for plan-level
+    /// partitioning resets like SPM and RepartitionExec::Hash).
+    pub partition_slice: Vec<usize>,
     /// Physical execution plan for this task.
     pub plan: Arc<dyn ExecutionPlan>,
     /// Timestamp when the task was launched.

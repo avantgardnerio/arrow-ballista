@@ -426,10 +426,12 @@ pub struct PartitionId {
 }
 /// Within-stage task identity (paired with job_id + stage_id on the parent
 /// MultiTaskDefinition). Post-substrate one task processes a slice of
-/// partitions, so `task_index` names the task slot within the stage; the
-/// actual partition slice is baked into the plan bytes (Scan file_groups /
-/// ShuffleReader partitions restricted at dispatch).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+/// partitions, so `task_index` names the task within the stage; `partition_slice`
+/// gives the concrete global partition ids the task's restricted plan is
+/// covering. Writers use these to name shuffle files with global identity
+/// (via `create_shuffle_path`) so downstream reads have a stable, canonical
+/// address regardless of how the scheduler split the work.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TaskId {
     #[prost(uint32, tag = "1")]
     pub task_id: u32,
@@ -437,6 +439,10 @@ pub struct TaskId {
     pub task_attempt_num: u32,
     #[prost(uint32, tag = "3")]
     pub task_index: u32,
+    /// Global partition ids covered by this task, in slice order. Position i in
+    /// the restricted plan corresponds to `partition_slice\[i\]` globally.
+    #[prost(uint32, repeated, tag = "4")]
+    pub partition_slice: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PartitionStats {
@@ -843,8 +849,14 @@ pub struct PollWorkParams {
     pub task_status: ::prost::alloc::vec::Vec<TaskStatus>,
 }
 /// Pull-based single-task dispatch. Post-substrate one task processes a
-/// slice of partitions, so `task_index` names the task slot within the
-/// stage; the actual partition slice is baked into the plan bytes.
+/// slice of partitions; `task_index` names the task within the stage,
+/// `partition_slice` gives the concrete global partition ids it covers. The
+/// task's plan is scheduler-side shrink-restricted so its leaves report
+/// `slice.len()` partitions; the writer uses `partition_slice` to attach
+/// global identity to shuffle files (except in cases where the plan itself
+/// resets partitioning: the writer walks its child plan to detect
+/// SortPreservingMergeExec or RepartitionExec::Hash and picks the right
+/// global mapping).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TaskDefinition {
     #[prost(uint32, tag = "1")]
@@ -867,6 +879,9 @@ pub struct TaskDefinition {
     pub launch_time: u64,
     #[prost(message, repeated, tag = "11")]
     pub props: ::prost::alloc::vec::Vec<KeyValuePair>,
+    /// Global partition ids covered by this task, in slice order.
+    #[prost(uint32, repeated, tag = "12")]
+    pub partition_slice: ::prost::alloc::vec::Vec<u32>,
 }
 /// A set of tasks in the same stage
 #[derive(Clone, PartialEq, ::prost::Message)]

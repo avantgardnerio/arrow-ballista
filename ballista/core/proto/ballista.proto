@@ -291,13 +291,18 @@ message PartitionId {
 
 // Within-stage task identity (paired with job_id + stage_id on the parent
 // MultiTaskDefinition). Post-substrate one task processes a slice of
-// partitions, so `task_index` names the task slot within the stage; the
-// actual partition slice is baked into the plan bytes (Scan file_groups /
-// ShuffleReader partitions restricted at dispatch).
+// partitions, so `task_index` names the task within the stage; `partition_slice`
+// gives the concrete global partition ids the task's restricted plan is
+// covering. Writers use these to name shuffle files with global identity
+// (via `create_shuffle_path`) so downstream reads have a stable, canonical
+// address regardless of how the scheduler split the work.
 message TaskId {
   uint32 task_id = 1;
   uint32 task_attempt_num = 2;
   uint32 task_index = 3;
+  // Global partition ids covered by this task, in slice order. Position i in
+  // the restricted plan corresponds to `partition_slice[i]` globally.
+  repeated uint32 partition_slice = 4;
 }
 
 message PartitionStats {
@@ -557,8 +562,14 @@ message PollWorkParams {
 }
 
 // Pull-based single-task dispatch. Post-substrate one task processes a
-// slice of partitions, so `task_index` names the task slot within the
-// stage; the actual partition slice is baked into the plan bytes.
+// slice of partitions; `task_index` names the task within the stage,
+// `partition_slice` gives the concrete global partition ids it covers. The
+// task's plan is scheduler-side shrink-restricted so its leaves report
+// `slice.len()` partitions; the writer uses `partition_slice` to attach
+// global identity to shuffle files (except in cases where the plan itself
+// resets partitioning: the writer walks its child plan to detect
+// SortPreservingMergeExec or RepartitionExec::Hash and picks the right
+// global mapping).
 message TaskDefinition {
   uint32 task_id = 1;
   uint32 task_attempt_num = 2;
@@ -570,6 +581,8 @@ message TaskDefinition {
   string session_id = 9;
   uint64 launch_time = 10;
   repeated KeyValuePair props = 11;
+  // Global partition ids covered by this task, in slice order.
+  repeated uint32 partition_slice = 12;
 }
 
 // A set of tasks in the same stage
