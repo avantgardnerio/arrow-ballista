@@ -1115,7 +1115,9 @@ impl ExecutionGraph for StaticExecutionGraph {
                         if *task_index >= success_stage.task_infos.len() {
                             return Err(BallistaError::Internal(format!(
                                 "Invalid task_index {} in map stage {} (task_infos has {} entries)",
-                                *task_index, stage_id, success_stage.task_infos.len()
+                                *task_index,
+                                stage_id,
+                                success_stage.task_infos.len()
                             )));
                         }
                         let task_info = &mut success_stage.task_infos[*task_index];
@@ -1146,7 +1148,9 @@ impl ExecutionGraph for StaticExecutionGraph {
                         if *task_index >= running_stage.task_infos.len() {
                             return Err(BallistaError::Internal(format!(
                                 "Invalid task_index {} in map stage {} (task_infos has {} entries)",
-                                *task_index, stage_id, running_stage.task_infos.len()
+                                *task_index,
+                                stage_id,
+                                running_stage.task_infos.len()
                             )));
                         }
                         running_stage.reset_task_info(*task_index);

@@ -53,6 +53,7 @@ pub trait ExecutionEngine: Sync + Send {
     ///
     /// The returned executor will be responsible for executing the given
     /// plan partition and writing shuffle output to the specified work directory.
+    #[allow(clippy::too_many_arguments)]
     fn create_query_stage_exec(
         &self,
         job_id: JobId,

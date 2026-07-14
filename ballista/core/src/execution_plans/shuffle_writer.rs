@@ -869,7 +869,7 @@ async fn run_coordinator(
                     grouped[handoff_idx].push(summary);
                 }
             }
-            for (slot, bucket) in senders.iter_mut().zip(grouped.into_iter()) {
+            for (slot, bucket) in senders.iter_mut().zip(grouped) {
                 if let Some(sender) = slot.take() {
                     let _ = sender.send(Ok(bucket));
                 }
@@ -1045,11 +1045,7 @@ mod tests {
         let total: u64 = batches
             .iter()
             .flat_map(|b| {
-                let stats = b
-                    .column(3)
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .unwrap();
+                let stats = b.column(3).as_any().downcast_ref::<StructArray>().unwrap();
                 let num_rows = stats
                     .column_by_name("num_rows")
                     .unwrap()
@@ -1119,11 +1115,7 @@ mod tests {
         let total: u64 = batches
             .iter()
             .flat_map(|b| {
-                let stats = b
-                    .column(3)
-                    .as_any()
-                    .downcast_ref::<StructArray>()
-                    .unwrap();
+                let stats = b.column(3).as_any().downcast_ref::<StructArray>().unwrap();
                 let num_rows = stats
                     .column_by_name("num_rows")
                     .unwrap()

@@ -729,11 +729,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                     .unwrap()
                     .as_millis() as u64,
                 props: task.session_config.to_key_value_pairs(),
-                partition_slice: task
-                    .partition_slice
-                    .iter()
-                    .map(|p| *p as u32)
-                    .collect(),
+                partition_slice: task.partition_slice.iter().map(|p| *p as u32).collect(),
             };
             Ok(task_definition)
         } else {
@@ -818,11 +814,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 task_id: task.task_id as u32,
                 task_attempt_num: task.task_attempt as u32,
                 task_index: task.key.task_index as u32,
-                partition_slice: task
-                    .partition_slice
-                    .iter()
-                    .map(|p| *p as u32)
-                    .collect(),
+                partition_slice: task.partition_slice.iter().map(|p| *p as u32).collect(),
             }];
             multi_tasks.push(MultiTaskDefinition {
                 task_ids,

@@ -1016,10 +1016,8 @@ impl SuccessfulStage {
         let mut seen = vec![false; self.partitions];
         let mut to_reschedule: Vec<usize> = vec![];
         for task in self.task_infos.iter().rev() {
-            let needs_reschedule = !matches!(
-                task.task_status,
-                task_status::Status::Successful(_)
-            );
+            let needs_reschedule =
+                !matches!(task.task_status, task_status::Status::Successful(_));
             for &p in &task.partition_slice {
                 if p < seen.len() && !seen[p] {
                     seen[p] = true;

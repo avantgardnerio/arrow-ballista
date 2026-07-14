@@ -912,7 +912,7 @@ async fn run_coordinator(
                     grouped[handoff_idx].push(summary);
                 }
             }
-            for (slot, bucket) in senders.iter_mut().zip(grouped.into_iter()) {
+            for (slot, bucket) in senders.iter_mut().zip(grouped) {
                 if let Some(sender) = slot.take() {
                     let _ = sender.send(Ok(bucket));
                 }
