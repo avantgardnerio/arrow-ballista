@@ -801,17 +801,17 @@ impl ExecutionGraph for StaticExecutionGraph {
                             );
                             continue;
                         }
-                        let partition_id = task_status.task_index as usize;
+                        let task_index = task_status.task_index as usize;
                         let task_identity = format!(
                             "TID {} {}/{}.{}/{}",
                             task_status.task_id,
                             job_id,
                             stage_id,
                             task_stage_attempt_num,
-                            partition_id
+                            task_index
                         );
                         if !running_stage
-                            .update_task_info(partition_id, task_status.clone())
+                            .update_task_info(task_index, task_status.clone())
                         {
                             continue;
                         }
@@ -894,16 +894,36 @@ impl ExecutionGraph for StaticExecutionGraph {
                                     if failed_task.retryable
                                         && failed_task.count_to_failures
                                     {
-                                        if running_stage.task_failure_number(partition_id)
+                                        if running_stage.task_failure_number(task_index)
                                             < max_task_failures
                                         {
                                             // TODO add new struct to track all the failed task infos
                                             // The failure TaskInfo is ignored and set to None here
-                                            running_stage.reset_task_info(partition_id);
+                                            running_stage.reset_task_info(task_index);
                                         } else {
+                                            // Report the *partitions* that hit the failure
+                                            // ceiling — task_index isn't user-meaningful
+                                            // under the append-only retries model (retries
+                                            // get fresh task_indices), but per-partition
+                                            // failure counters are the durable identity.
+                                            let over_limit: Vec<usize> = running_stage
+                                                .task_infos[task_index]
+                                                .partition_slice
+                                                .iter()
+                                                .copied()
+                                                .filter(|p| {
+                                                    running_stage.task_failure_numbers[*p]
+                                                        >= max_task_failures
+                                                })
+                                                .collect();
+                                            let subject = if over_limit.len() == 1 {
+                                                format!("Task {}", over_limit[0])
+                                            } else {
+                                                format!("Tasks {over_limit:?}")
+                                            };
                                             let error_msg = format!(
-                                                "Task {} in Stage {} failed {} times, fail the stage, most recent failure reason: {:?}",
-                                                partition_id,
+                                                "{} in Stage {} failed {} times, fail the stage, most recent failure reason: {:?}",
+                                                subject,
                                                 stage_id,
                                                 max_task_failures,
                                                 failed_task.error
@@ -914,12 +934,12 @@ impl ExecutionGraph for StaticExecutionGraph {
                                     } else if failed_task.retryable {
                                         // TODO add new struct to track all the failed task infos
                                         // The failure TaskInfo is ignored and set to None here
-                                        running_stage.reset_task_info(partition_id);
+                                        running_stage.reset_task_info(task_index);
                                     }
                                 }
                                 None => {
                                     let error_msg = format!(
-                                        "Task {partition_id} in Stage {stage_id} failed with unknown failure reasons, fail the stage"
+                                        "Task {task_index} in Stage {stage_id} failed with unknown failure reasons, fail the stage"
                                     );
                                     error!("{error_msg}");
                                     failed_stages.insert(stage_id, error_msg);
@@ -931,11 +951,11 @@ impl ExecutionGraph for StaticExecutionGraph {
                         {
                             // update task metrics for successfu task
                             running_stage
-                                .update_task_metrics(partition_id, operator_metrics)?;
+                                .update_task_metrics(task_index, operator_metrics)?;
 
                             locations.append(&mut partition_to_location(
                                 &job_id,
-                                partition_id,
+                                task_index,
                                 stage_id,
                                 executor,
                                 successful_task.partitions,
@@ -978,14 +998,14 @@ impl ExecutionGraph for StaticExecutionGraph {
                     for task_status in stage_task_statuses.into_iter() {
                         let task_stage_attempt_num =
                             task_status.stage_attempt_num as usize;
-                        let partition_id = task_status.task_index as usize;
+                        let task_index = task_status.task_index as usize;
                         let task_identity = format!(
                             "TID {} {}/{}.{}/{}",
                             task_status.task_id,
                             job_id,
                             stage_id,
                             task_stage_attempt_num,
-                            partition_id
+                            task_index
                         );
                         let mut should_ignore = true;
                         // handle delayed failed tasks if the stage's next attempt is still in UnResolved status.
@@ -1075,17 +1095,30 @@ impl ExecutionGraph for StaticExecutionGraph {
                 .insert(*stage_id, HashSet::from_iter(attempts.iter().copied()));
         }
 
-        for (stage_id, missing_parts) in &resubmit_successful_stages {
+        // The values in `resubmit_successful_stages` and `reset_running_stages`
+        // come out of `remove_input_partitions` collecting
+        // `loc.map_partition_id`, which under the multi-partition-task model
+        // is the source task's `task_index` (see `partition_to_location`).
+        // So the set members are task_indices, not partition ids — bounds
+        // check against `task_infos.len()` and pass through to
+        // `reset_task_info` / `task_infos[...]` directly.
+        //
+        // TODO: switch to partition-id semantics — push only the actually-lost
+        // partition_ids back into `stage.pending`, avoiding the "redo the
+        // whole map task's slice" waste on partial-loss scenarios. Needs
+        // `remove_input_partitions` to expose partition_ids (from the outer
+        // map key) and a way to partial-reset a still-Running task.
+        for (stage_id, missing_task_indices) in &resubmit_successful_stages {
             if let Some(stage) = self.stages.get_mut(stage_id) {
                 if let ExecutionStage::Successful(success_stage) = stage {
-                    for partition in missing_parts {
-                        if *partition > success_stage.partitions {
+                    for task_index in missing_task_indices {
+                        if *task_index >= success_stage.task_infos.len() {
                             return Err(BallistaError::Internal(format!(
-                                "Invalid partition ID {} in map stage {}",
-                                *partition, stage_id
+                                "Invalid task_index {} in map stage {} (task_infos has {} entries)",
+                                *task_index, stage_id, success_stage.task_infos.len()
                             )));
                         }
-                        let task_info = &mut success_stage.task_infos[*partition];
+                        let task_info = &mut success_stage.task_infos[*task_index];
                         // Update the task info to failed
                         task_info.task_status = task_status::Status::Failed(FailedTask {
                             error: "FetchPartitionError in parent stage".to_owned(),
@@ -1106,17 +1139,17 @@ impl ExecutionGraph for StaticExecutionGraph {
             }
         }
 
-        for (stage_id, missing_parts) in &reset_running_stages {
+        for (stage_id, missing_task_indices) in &reset_running_stages {
             if let Some(stage) = self.stages.get_mut(stage_id) {
                 if let ExecutionStage::Running(running_stage) = stage {
-                    for partition in missing_parts {
-                        if *partition > running_stage.partitions {
+                    for task_index in missing_task_indices {
+                        if *task_index >= running_stage.task_infos.len() {
                             return Err(BallistaError::Internal(format!(
-                                "Invalid partition ID {} in map stage {}",
-                                *partition, stage_id
+                                "Invalid task_index {} in map stage {} (task_infos has {} entries)",
+                                *task_index, stage_id, running_stage.task_infos.len()
                             )));
                         }
-                        running_stage.reset_task_info(*partition);
+                        running_stage.reset_task_info(*task_index);
                     }
                 } else {
                     warn!(
@@ -2171,10 +2204,15 @@ mod test {
         assert_eq!(agg_graph.available_tasks(), 1);
 
         let mut last_attempt = 0;
-        // 2rd task's attempts
+        // 2rd task's attempts.
+        //
+        // Under the append-only task_infos model, each retry gets a fresh
+        // task_index (rather than reusing the original task's slot). The
+        // partition_slice is what stably identifies "which task is being
+        // retried" — assert on that instead of task_index.
         for attempt in 1..5 {
             if let Some(task2_attempt) = agg_graph.pop_next_task(&executor.id)? {
-                assert_eq!(task2_attempt.key.task_index, task2.key.task_index);
+                assert_eq!(task2_attempt.partition_slice, task2.partition_slice);
                 assert_eq!(task2_attempt.task_attempt, attempt);
                 last_attempt = task2_attempt.task_attempt;
                 let task_status = mock_failed_task(

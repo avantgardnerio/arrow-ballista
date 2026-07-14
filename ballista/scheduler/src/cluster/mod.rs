@@ -584,36 +584,39 @@ mod test {
         let budgets_ref: Vec<&mut AvailableVcores> = budgets.iter_mut().collect();
         let bound_tasks =
             bind_task_bias(budgets_ref, Arc::new(active_jobs), |_| false).await;
-        assert_eq!(9, bound_tasks.len());
+        // 9 total pending partitions (job_a: 2, job_b: 7) — verify all were
+        // covered. Task count is emergent under multi-partition binding.
+        assert_eq!(9, total_partitions_covered(&bound_tasks));
 
         let result = get_result(bound_tasks);
 
+        // Multi-partition-task binding: each executor consumes its full
+        // vcore budget in one task per (job, stage). Distribution depends
+        // on HashMap iteration order across jobs.
         let mut expected = Vec::new();
         {
+            // job_a iterated first: exec_3(7) takes job_a's 2 partitions,
+            // then exec_2(5) + exec_1(3) split job_b's 7 partitions as 5/2.
             let mut expected0: HashMap<JobId, HashMap<String, usize>> = HashMap::new();
-
             let mut entry_a = HashMap::new();
             entry_a.insert("executor_3".to_string(), 2);
             let mut entry_b = HashMap::new();
-            entry_b.insert("executor_3".to_string(), 5);
-            entry_b.insert("executor_2".to_string(), 2);
-
+            entry_b.insert("executor_2".to_string(), 5);
+            entry_b.insert("executor_1".to_string(), 2);
             expected0.insert("job_a".into(), entry_a);
             expected0.insert("job_b".into(), entry_b);
-
             expected.push(expected0);
         }
         {
+            // job_b iterated first: exec_3(7) takes job_b's full 7 partitions,
+            // then exec_2(5) takes job_a's 2.
             let mut expected0: HashMap<JobId, HashMap<String, usize>> = HashMap::new();
-
             let mut entry_b = HashMap::new();
             entry_b.insert("executor_3".to_string(), 7);
             let mut entry_a = HashMap::new();
             entry_a.insert("executor_2".to_string(), 2);
-
             expected0.insert("job_a".into(), entry_a);
             expected0.insert("job_b".into(), entry_b);
-
             expected.push(expected0);
         }
 
@@ -633,41 +636,40 @@ mod test {
         let budgets_ref: Vec<&mut AvailableVcores> = budgets.iter_mut().collect();
         let bound_tasks =
             bind_task_round_robin(budgets_ref, Arc::new(active_jobs), |_| false).await;
-        assert_eq!(9, bound_tasks.len());
+        // 9 total pending partitions (job_a: 2, job_b: 7) — verify all were
+        // covered. Task count is emergent under multi-partition binding.
+        assert_eq!(9, total_partitions_covered(&bound_tasks));
 
         let result = get_result(bound_tasks);
 
+        // Multi-partition-task binding: same shape as bias variant under this
+        // mock — each executor consumes its full vcore budget in one task per
+        // (job, stage) and round-robin's idx rotation gives the same
+        // ordering. Two variants depending on job HashMap iteration order.
         let mut expected: Vec<HashMap<JobId, HashMap<String, usize>>> = Vec::new();
         {
+            // job_a iterated first: exec_3(7) takes job_a's 2 partitions,
+            // then exec_2(5) + exec_1(3) split job_b's 7 as 5/2.
             let mut expected0: HashMap<JobId, HashMap<String, usize>> = HashMap::new();
-
             let mut entry_a = HashMap::new();
-            entry_a.insert("executor_3".to_string(), 1);
-            entry_a.insert("executor_2".to_string(), 1);
+            entry_a.insert("executor_3".to_string(), 2);
             let mut entry_b = HashMap::new();
-            entry_b.insert("executor_1".to_string(), 3);
-            entry_b.insert("executor_3".to_string(), 2);
-            entry_b.insert("executor_2".to_string(), 2);
-
+            entry_b.insert("executor_2".to_string(), 5);
+            entry_b.insert("executor_1".to_string(), 2);
             expected0.insert("job_a".into(), entry_a);
             expected0.insert("job_b".into(), entry_b);
-
             expected.push(expected0);
         }
         {
+            // job_b iterated first: exec_3(7) takes job_b's full 7,
+            // then exec_2(5) takes job_a's 2.
             let mut expected0: HashMap<JobId, HashMap<String, usize>> = HashMap::new();
-
             let mut entry_b = HashMap::new();
-            entry_b.insert("executor_3".to_string(), 3);
-            entry_b.insert("executor_2".to_string(), 2);
-            entry_b.insert("executor_1".to_string(), 2);
+            entry_b.insert("executor_3".to_string(), 7);
             let mut entry_a = HashMap::new();
-            entry_a.insert("executor_2".to_string(), 1);
-            entry_a.insert("executor_1".to_string(), 1);
-
+            entry_a.insert("executor_2".to_string(), 2);
             expected0.insert("job_a".into(), entry_a);
             expected0.insert("job_b".into(), entry_b);
-
             expected.push(expected0);
         }
 
@@ -679,6 +681,11 @@ mod test {
         Ok(())
     }
 
+    /// Sum partitions covered per (job, executor). Post-substrate one task
+    /// covers a slice of partitions rather than exactly one, so counting
+    /// bound tasks would understate the distribution. Summing
+    /// `partition_slice.len()` preserves the "N partitions distributed as
+    /// X/Y/Z across executors" invariant the assertions actually care about.
     fn get_result(bound_tasks: Vec<BoundTask>) -> HashMap<JobId, HashMap<String, usize>> {
         let mut result = HashMap::new();
 
@@ -687,10 +694,20 @@ mod test {
                 .entry(bound_task.1.key.job_id)
                 .or_insert_with(HashMap::new);
             let n = entry.entry(bound_task.0).or_insert_with(|| 0);
-            *n += 1;
+            *n += bound_task.1.partition_slice.len();
         }
 
         result
+    }
+
+    /// Total partitions covered across every bound task — the multi-partition
+    /// analogue of "how many tasks did we bind" for tests that used to assert
+    /// on `bound_tasks.len()`.
+    fn total_partitions_covered(bound_tasks: &[BoundTask]) -> usize {
+        bound_tasks
+            .iter()
+            .map(|(_, task)| task.partition_slice.len())
+            .sum()
     }
 
     async fn mock_active_jobs(

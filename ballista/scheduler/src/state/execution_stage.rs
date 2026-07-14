@@ -1005,18 +1005,31 @@ impl Debug for RunningStage {
 impl SuccessfulStage {
     /// Change to the running state and bump the stage attempt number.
     ///
-    /// Successful task_infos are preserved (their partitions don't need
-    /// re-processing). Any task_infos marked Failed(ResultLost) by
-    /// `reset_tasks` contribute their partition_slice back to `pending`
-    /// so the next bind picks them up.
+    /// task_infos is append-only across retries — the same partition may
+    /// appear in multiple entries (an old Failed one from a lost executor
+    /// plus a later Successful one from the retry). Walk newest-to-oldest
+    /// and, for each partition, only consider the *latest* attempt: if it's
+    /// Successful the partition is done; otherwise it goes back to pending.
+    /// Naive iteration would push the same partition multiple times.
     pub fn to_running(&self) -> RunningStage {
         let mut pending = PendingPartitions::empty(self.partitions);
+        let mut seen = vec![false; self.partitions];
         let mut to_reschedule: Vec<usize> = vec![];
-        for task in self.task_infos.iter() {
-            if !matches!(task.task_status, task_status::Status::Successful(_)) {
-                to_reschedule.extend(task.partition_slice.iter().copied());
+        for task in self.task_infos.iter().rev() {
+            let needs_reschedule = !matches!(
+                task.task_status,
+                task_status::Status::Successful(_)
+            );
+            for &p in &task.partition_slice {
+                if p < seen.len() && !seen[p] {
+                    seen[p] = true;
+                    if needs_reschedule {
+                        to_reschedule.push(p);
+                    }
+                }
             }
         }
+        to_reschedule.sort_unstable();
         pending.reschedule(to_reschedule);
         let stage_metrics = if self.stage_metrics.is_empty() {
             None
@@ -1132,12 +1145,26 @@ impl Debug for FailedStage {
 /// where physical work originates (scans, shuffle reads, empty execs);
 /// intermediate operators — including partition-count-changing ones like
 /// DynamicRangeRepartitionExec — are walked past. Multi-child operators
-/// (union, join) sum across branches, matching how task work fans out.
+/// (union, cross join, nested-loop join) sum across branches, matching how
+/// task work fans out.
+///
+/// Aligned-input joins (`HashJoinExec`, `SortMergeJoinExec`) are treated as
+/// leaves — their operator semantics pair partition `i` of one side with
+/// partition `i` of the other, so the natural work unit is the operator's
+/// own `output_partitioning().partition_count()`, not the sum of both
+/// sides. Walking past would double-count.
 ///
 /// This gives task assignment the true amount of input work in a stage,
 /// independent of any within-stage repartitioning that would otherwise
 /// obscure it in `plan.output_partitioning().partition_count()`.
 fn sum_leaf_scan_partitions(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    use datafusion::physical_plan::joins::{HashJoinExec, SortMergeJoinExec};
+
+    if plan.downcast_ref::<HashJoinExec>().is_some()
+        || plan.downcast_ref::<SortMergeJoinExec>().is_some()
+    {
+        return plan.properties().output_partitioning().partition_count();
+    }
     let children = plan.children();
     if children.is_empty() {
         return plan.properties().output_partitioning().partition_count();
@@ -1150,6 +1177,13 @@ fn sum_leaf_scan_partitions(plan: &Arc<dyn ExecutionPlan>) -> usize {
 /// (`PendingPartitions`) sized to whichever executor's free vcores show
 /// up, so one 16-vcore exec covers 16 partitions in a single task while
 /// four 4-vcore execs cover the same 16 in four tasks.
+///
+/// TODO: right-sizing this is genuinely hard. Summing leaves is correct
+/// for DRR-shaped operators that poll all inputs simultaneously
+/// (parallelism ∝ input count) but overcounts stages whose plan aligns
+/// co-dependent inputs (e.g. `HashJoinExec` produces K output partitions
+/// from 2K leaf partitions — natural unit is K, not 2K). The right answer
+/// depends on operator semantics we don't currently inspect here.
 fn stage_input_partitions(plan: &Arc<dyn ExecutionPlan>) -> usize {
     if plan.downcast_ref::<ShuffleWriterExec>().is_some()
         || plan.downcast_ref::<SortShuffleWriterExec>().is_some()

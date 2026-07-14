@@ -868,17 +868,20 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                 .insert(*stage_id, HashSet::from_iter(attempts.iter().copied()));
         }
 
-        for (stage_id, missing_parts) in &resubmit_successful_stages {
+        // Values coming out of `remove_input_partitions` are task_indices
+        // under the multi-partition-task model (see the mirror site in
+        // `execution_graph.rs` for the TODO on partition-id semantics).
+        for (stage_id, missing_task_indices) in &resubmit_successful_stages {
             if let Some(stage) = self.stages.get_mut(stage_id) {
                 if let ExecutionStage::Successful(success_stage) = stage {
-                    for partition in missing_parts {
-                        if *partition > success_stage.partitions {
+                    for task_index in missing_task_indices {
+                        if *task_index >= success_stage.task_infos.len() {
                             return Err(BallistaError::Internal(format!(
-                                "Invalid partition ID {} in map stage {}",
-                                *partition, stage_id
+                                "Invalid task_index {} in map stage {} (task_infos has {} entries)",
+                                *task_index, stage_id, success_stage.task_infos.len()
                             )));
                         }
-                        let task_info = &mut success_stage.task_infos[*partition];
+                        let task_info = &mut success_stage.task_infos[*task_index];
                         // Update the task info to failed
                         task_info.task_status = task_status::Status::Failed(FailedTask {
                             error: "FetchPartitionError in parent stage".to_owned(),
@@ -899,17 +902,17 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
             }
         }
 
-        for (stage_id, missing_parts) in &reset_running_stages {
+        for (stage_id, missing_task_indices) in &reset_running_stages {
             if let Some(stage) = self.stages.get_mut(stage_id) {
                 if let ExecutionStage::Running(running_stage) = stage {
-                    for partition in missing_parts {
-                        if *partition > running_stage.partitions {
+                    for task_index in missing_task_indices {
+                        if *task_index >= running_stage.task_infos.len() {
                             return Err(BallistaError::Internal(format!(
-                                "Invalid partition ID {} in map stage {}",
-                                *partition, stage_id
+                                "Invalid task_index {} in map stage {} (task_infos has {} entries)",
+                                *task_index, stage_id, running_stage.task_infos.len()
                             )));
                         }
-                        running_stage.reset_task_info(*partition);
+                        running_stage.reset_task_info(*task_index);
                     }
                 } else {
                     warn!(
