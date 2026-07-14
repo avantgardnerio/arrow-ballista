@@ -123,7 +123,15 @@ fn walk_child_partition_mapping(
                 return GlobalPartitionMap::HashSpace;
             }
             Partitioning::UnknownPartitioning(_) => {
-                return GlobalPartitionMap::PassThrough(partition_slice.to_vec());
+                // RepartitionExec still exchanges rows and freshly numbers
+                // its K outputs, so partition_slice[local] would be a
+                // meaningless mapping. DataFusion's BatchPartitioner also
+                // rejects this scheme (`not_impl_err!`), so reaching this
+                // arm means an upstream invariant has broken — fail loudly.
+                panic!(
+                    "unexpected RepartitionExec::UnknownPartitioning \
+                     in shuffle-writer child plan"
+                );
             }
         }
     }
