@@ -69,10 +69,10 @@ pub struct PartitionId {
     pub partition_id: usize,
 }
 
-/// Locator for a task within an execution graph: (job, stage, task slot).
+/// Locator for a task within an execution graph: (job, stage, task_index).
 ///
-/// Post-substrate one task processes a partition slice, so the third
-/// component is `task_index` (task slot within the stage), not a partition
+/// One task processes a partition slice, so the third component is
+/// `task_index` (the task's index within the stage), not a partition
 /// index. Sibling to [`PartitionId`] — [`PartitionId`] identifies an
 /// operator output partition (shuffle location, etc.), [`TaskKey`]
 /// identifies a scheduled task attempt.

@@ -1729,8 +1729,8 @@ impl ExecutionPlanVisitor for ExecutionStageBuilder {
 
 /// Represents the basic unit of work for the Ballista executor.
 ///
-/// Post-substrate one `TaskDescription` drives all of `partition_slice`'s
-/// partitions through one plan-Arc on the assigned executor.
+/// One `TaskDescription` drives all of `partition_slice`'s partitions
+/// through one plan-Arc on the assigned executor.
 #[derive(Clone)]
 pub struct TaskDescription {
     /// The session ID associated with this task's job.

@@ -262,12 +262,12 @@ pub struct FailedStage {
 
 /// Cursor over the partitions remaining to be scheduled for a stage.
 ///
-/// Post-substrate one task processes a slice of partitions (up to
-/// `exec.vcores`). Rather than pre-computing num_tasks at resolve time
-/// and pre-allocating `Vec<Option<TaskInfo>>`, the number of tasks is
-/// emergent: at bind time each executor's free-vcore budget pulls a
-/// chunk of partitions off the queue. Retries push failed partitions to
-/// the front so they get re-attempted before any fresh partition.
+/// One task processes a slice of partitions (up to `exec.vcores`). Rather
+/// than pre-computing num_tasks at resolve time and pre-allocating
+/// `Vec<Option<TaskInfo>>`, the number of tasks is emergent: at bind time
+/// each executor's free-vcore budget pulls a chunk of partitions off the
+/// queue. Retries push failed partitions to the front so they get
+/// re-attempted before any fresh partition.
 #[derive(Clone, Debug)]
 pub struct PendingPartitions {
     /// Total plan input partitions this stage must process (frozen).
@@ -738,8 +738,8 @@ impl RunningStage {
     }
 
     /// Returns the number of plan input partitions still waiting to be
-    /// handed to a task. This is the substrate for scheduling decisions:
-    /// as executors free vcores, `pending.next_slice(exec.vcores)` drains
+    /// handed to a task. This is what scheduling decisions draw from: as
+    /// executors free vcores, `pending.next_slice(exec.vcores)` drains
     /// this pool into fresh tasks.
     pub fn available_tasks(&self) -> usize {
         self.pending.remaining()

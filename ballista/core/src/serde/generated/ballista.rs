@@ -425,9 +425,9 @@ pub struct PartitionId {
     pub partition_id: u32,
 }
 /// Within-stage task identity (paired with job_id + stage_id on the parent
-/// MultiTaskDefinition). Post-substrate one task processes a slice of
-/// partitions, so `task_index` names the task within the stage; `partition_slice`
-/// gives the concrete global partition ids the task's restricted plan is
+/// MultiTaskDefinition). One task processes a slice of partitions, so
+/// `task_index` names the task within the stage; `partition_slice` gives
+/// the concrete global partition ids the task's restricted plan is
 /// covering. Writers use these to name shuffle files with global identity
 /// (via `create_shuffle_path`) so downstream reads have a stable, canonical
 /// address regardless of how the scheduler split the work.
@@ -811,8 +811,9 @@ pub struct TaskStatus {
     pub stage_id: u32,
     #[prost(uint32, tag = "4")]
     pub stage_attempt_num: u32,
-    /// Task slot within the stage (was `partition_id` — under substrate one
-    /// task processes a partition slice, not a single partition).
+    /// Task index within the stage (was `partition_id` — under the
+    /// multi-partition-task model one task processes a partition slice, not a
+    /// single partition).
     #[prost(uint32, tag = "5")]
     pub task_index: u32,
     #[prost(uint64, tag = "6")]
@@ -848,8 +849,8 @@ pub struct PollWorkParams {
     #[prost(message, repeated, tag = "3")]
     pub task_status: ::prost::alloc::vec::Vec<TaskStatus>,
 }
-/// Pull-based single-task dispatch. Post-substrate one task processes a
-/// slice of partitions; `task_index` names the task within the stage,
+/// Pull-based single-task dispatch. One task processes a slice of
+/// partitions; `task_index` names the task within the stage,
 /// `partition_slice` gives the concrete global partition ids it covers. The
 /// task's plan is scheduler-side shrink-restricted so its leaves report
 /// `slice.len()` partitions; the writer uses `partition_slice` to attach

@@ -681,9 +681,9 @@ mod test {
         Ok(())
     }
 
-    /// Sum partitions covered per (job, executor). Post-substrate one task
-    /// covers a slice of partitions rather than exactly one, so counting
-    /// bound tasks would understate the distribution. Summing
+    /// Sum partitions covered per (job, executor). Under multi-partition
+    /// tasks one task covers a slice of partitions rather than exactly one,
+    /// so counting bound tasks would understate the distribution. Summing
     /// `partition_slice.len()` preserves the "N partitions distributed as
     /// X/Y/Z across executors" invariant the assertions actually care about.
     fn get_result(bound_tasks: Vec<BoundTask>) -> HashMap<JobId, HashMap<String, usize>> {
