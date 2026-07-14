@@ -355,6 +355,15 @@ pub trait JobState: Send + Sync {
 /// executor's free vcores, append the resulting `TaskInfo` to the stage,
 /// and produce a `TaskDescription` for dispatch. Consumes the executor's
 /// remaining vcore budget entirely — leftover packing is c5, deferred.
+///
+/// For single-partition operators like `SortPreservingMergeExec`, all
+/// input partitions need to go to one executor — splitting them across
+/// tasks would give each task's local SPM only a slice of the inputs,
+/// producing per-task locally-sorted files that concatenate in
+/// nondeterministic order. Detect the collapsed-output case and take the
+/// entire pending queue in a single bind regardless of vcore budget; the
+/// per-task plan restriction on the full slice is a no-op, so the SPM
+/// still sees every input.
 fn bind_one(
     running_stage: &mut crate::state::execution_stage::RunningStage,
     task_id_gen: &mut usize,
@@ -362,7 +371,18 @@ fn bind_one(
     job_id: &JobId,
     budget: &mut AvailableVcores,
 ) -> Option<BoundTask> {
-    let slice = running_stage.pending.next_slice(budget.vcores as usize);
+    let max = if running_stage
+        .plan
+        .properties()
+        .output_partitioning()
+        .partition_count()
+        == 1
+    {
+        usize::MAX
+    } else {
+        budget.vcores as usize
+    };
+    let slice = running_stage.pending.next_slice(max);
     if slice.is_empty() {
         return None;
     }
