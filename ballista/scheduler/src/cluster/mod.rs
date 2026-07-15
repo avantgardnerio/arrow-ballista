@@ -23,6 +23,7 @@ use crate::state::execution_graph::{
 };
 use crate::state::task_manager::JobInfoCache;
 use ballista_core::error::Result;
+use ballista_core::execution_plans::ShuffleReaderExec;
 use ballista_core::serde::protobuf::{
     AvailableVcores, ExecutorHeartbeat, JobStatus, job_status,
 };
@@ -351,19 +352,54 @@ pub trait JobState: Send + Sync {
     fn produce_config(&self) -> SessionConfig;
 }
 
+/// Whether this stage's plan contains a collapse — any operator whose
+/// `output_partitioning().partition_count() == 1` (`CoalescePartitionsExec`,
+/// `SortPreservingMergeExec`, `AggregateExec(Final, gby=[])`,
+/// `SortExec(preserve_partitioning=false)`, …). Downstream of a collapse
+/// expects the *combined* input; splitting across tasks would give each
+/// task's local collapse only a slice, producing partial results.
+///
+/// Walks past *any* single-child operator: today's writers that bake
+/// partitioning into the shuffle write itself (`SortShuffleWriterExec::Hash`),
+/// and future partition operators that separate partitioning from writing
+/// (e.g. `UnorderedRangeRepartitionExec`). Stops at leaves, multi-child
+/// operators (fan-in / joins), and stage boundaries.
+///
+/// The stage-boundary stop is currently a `ShuffleReaderExec` downcast — the
+/// only kind of stage-boundary leaf that appears in a resolved stage plan.
+/// The *general* rule is "stop at any stage boundary"; if new stage-boundary
+/// operators appear, add them here (or, better, get `ExecutionPlan` upstream
+/// to expose an `is_stage_boundary()` property so we don't keep
+/// enumerating).
+fn stage_has_input_collapse(plan_root: &Arc<dyn ExecutionPlan>) -> bool {
+    fn walk(node: &Arc<dyn ExecutionPlan>) -> bool {
+        if node.downcast_ref::<ShuffleReaderExec>().is_some() {
+            return false;
+        }
+        if node.properties().output_partitioning().partition_count() == 1 {
+            return true;
+        }
+        match node.children().as_slice() {
+            [child] => walk(child),
+            _ => false,
+        }
+    }
+    match plan_root.children().as_slice() {
+        [child] => walk(child),
+        _ => false,
+    }
+}
+
 /// Bind a task to an executor: draw a partition slice sized to that
 /// executor's free vcores, append the resulting `TaskInfo` to the stage,
 /// and produce a `TaskDescription` for dispatch. Consumes the executor's
-/// remaining vcore budget entirely — leftover packing is c5, deferred.
+/// remaining vcore budget entirely — leftover packing is a TODO
 ///
-/// For single-partition operators like `SortPreservingMergeExec`, all
-/// input partitions need to go to one executor — splitting them across
-/// tasks would give each task's local SPM only a slice of the inputs,
-/// producing per-task locally-sorted files that concatenate in
-/// nondeterministic order. Detect the collapsed-output case and take the
-/// entire pending queue in a single bind regardless of vcore budget; the
-/// per-task plan restriction on the full slice is a no-op, so the SPM
-/// still sees every input.
+/// When the stage's plan contains a collapse (see
+/// [`stage_has_input_collapse`]), take the entire pending queue in a single
+/// bind regardless of vcore budget — otherwise each task's local collapse
+/// would only see its slice, yielding partial results downstream tries to
+/// merge (e.g. 16 partial-maxes instead of one global max).
 fn bind_one(
     running_stage: &mut crate::state::execution_stage::RunningStage,
     task_id_gen: &mut usize,
@@ -371,13 +407,7 @@ fn bind_one(
     job_id: &JobId,
     budget: &mut AvailableVcores,
 ) -> Option<BoundTask> {
-    let max = if running_stage
-        .plan
-        .properties()
-        .output_partitioning()
-        .partition_count()
-        == 1
-    {
+    let max = if stage_has_input_collapse(&running_stage.plan) {
         usize::MAX
     } else {
         budget.vcores as usize
