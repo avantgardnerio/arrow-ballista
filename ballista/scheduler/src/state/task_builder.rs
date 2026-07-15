@@ -25,15 +25,18 @@
 //! restricted count.
 //!
 //! Restriction is *scoped*: a leaf below a collapse (`CoalescePartitionsExec`,
-//! `SortPreservingMergeExec`, or a `SinglePartition`-requiring join build side)
-//! must read the entire upstream, not the task's slice — otherwise each of N
-//! sibling tasks would collapse only 1/N of the input, producing partial
-//! results downstream tries to merge (e.g. the wrong scalar threshold from a
-//! HAVING subquery). The rewriter tracks these scopes on a stack so
-//! leaves know which mode to apply.
+//! `SortPreservingMergeExec`, or the `SinglePartition`-requiring build side
+//! of a join) must read the entire upstream, not the task's slice — otherwise
+//! each of N sibling tasks would collapse only 1/N of the input, producing
+//! partial results downstream tries to merge (e.g. the wrong scalar threshold
+//! from a HAVING subquery).
+//!
+//! Scoping is expressed as an `under_collect: bool` parameter threaded down
+//! the recursion. The call stack is the tree walk's natural stack; scope
+//! flows from parent to descendants via function arguments, so sibling
+//! subtrees never share state and there's no traversal-order dependency.
 
 use ballista_core::execution_plans::ShuffleReaderExec;
-use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::datasource::physical_plan::{
     FileGroup, FileScanConfig, FileScanConfigBuilder,
@@ -45,6 +48,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::{HashJoinExec, NestedLoopJoinExec};
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::with_new_children_if_necessary;
 use log::warn;
 use std::any::Any;
 use std::sync::Arc;
@@ -58,171 +62,162 @@ pub fn restrict_plan_to_partitions(
     plan: Arc<dyn ExecutionPlan>,
     partitions: &[usize],
 ) -> Result<Arc<dyn ExecutionPlan>> {
-    let mut rewriter = TaskPlanRewriter {
-        partitions,
-        scopes: vec![],
-    };
-    Ok(plan.rewrite(&mut rewriter)?.data)
+    // TODO: test with unions
+    restrict(plan, partitions, /* under_collect */ false)
 }
 
-/// Descent-time scope for `TaskPlanRewriter`.
-///
-/// The rewriter walks the plan top-down. When it enters an operator that
-/// requires its subtree to produce all partitions (a collapse), it pushes a
-/// `Collect` frame. Each leaf pops the current scope: `Collect` means read the
-/// entire upstream; `None` means restrict to the task's `partitions`.
-#[derive(Debug, Clone, Copy)]
-enum Scope {
-    /// A collapse operator ancestor demands every upstream partition. Leaves
-    /// under this scope skip restriction.
-    Collect,
-}
-
-struct TaskPlanRewriter<'a> {
-    partitions: &'a [usize],
-    scopes: Vec<Scope>,
-}
-
-impl TreeNodeRewriter for TaskPlanRewriter<'_> {
-    type Node = Arc<dyn ExecutionPlan>;
-
-    fn f_down(&mut self, node: Self::Node) -> Result<Transformed<Self::Node>> {
-        // Leaves consume the current scope and restrict (or not) accordingly.
-        if let Some(rewritten) = self.rewrite_shuffle_reader(&node) {
-            return Ok(Transformed::yes(rewritten));
-        }
-        if let Some(rewritten) = self.rewrite_scan(&node) {
-            return Ok(Transformed::yes(rewritten));
-        }
-
-        // Interior operators push a scope for their subtree when they require
-        // all upstream partitions in one place.
-        if node.is::<CoalescePartitionsExec>() || node.is::<SortPreservingMergeExec>() {
-            // A nested Coalesce/SPM inside an existing `Collect` scope is a
-            // no-op — the outer scope already forces "read everything".
-            if !matches!(self.scopes.last(), Some(Scope::Collect)) {
-                self.scopes.push(Scope::Collect);
-            }
-            return Ok(Transformed::no(node));
-        }
-
-        if node.is::<HashJoinExec>() || node.is::<NestedLoopJoinExec>() {
-            // Push a `Collect` per input that requires a single partition
-            // (typically a broadcast build side). Handles plans where the
-            // build side collapses to 1 without an explicit
-            // CoalescePartitionsExec above the reader.
-            for dist in node.required_input_distribution() {
-                if matches!(dist, Distribution::SinglePartition) {
-                    self.scopes.push(Scope::Collect);
-                }
-            }
-            return Ok(Transformed::no(node));
-        }
-
-        Ok(Transformed::no(node))
+/// Recursive worker. `under_collect` is the scope inherited from ancestors:
+/// once set, every descendant leaf reads the full upstream. Scope is passed
+/// by value, so sibling subtrees never leak state to each other.
+fn restrict(
+    plan: Arc<dyn ExecutionPlan>,
+    partitions: &[usize],
+    under_collect: bool,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    // Leaves apply (or skip) restriction based on the current scope.
+    if let Some(rewritten) = rewrite_shuffle_reader(&plan, partitions, under_collect) {
+        return Ok(rewritten);
     }
+    if let Some(rewritten) = rewrite_scan(&plan, partitions, under_collect) {
+        return Ok(rewritten);
+    }
+
+    // Interior: compute per-child scope, recurse, rebuild the node.
+    let per_child = child_scopes(&plan, under_collect);
+    let new_children: Vec<Arc<dyn ExecutionPlan>> = plan
+        .children()
+        .into_iter()
+        .cloned()
+        .zip(per_child)
+        .map(|(child, collect)| restrict(child, partitions, collect))
+        .collect::<Result<Vec<_>>>()?;
+    with_new_children_if_necessary(plan, new_children)
 }
 
-impl TaskPlanRewriter<'_> {
-    /// Restrict a `ShuffleReaderExec` so only the assigned `partitions` remain
-    /// in its `partition` vec. Output_partitioning shrinks to
-    /// `partitions.len()` but **preserves the partitioning kind** — a
-    /// `Hash([col], N)` reader becomes `Hash([col], kept.len())`, not
-    /// `UnknownPartitioning`. This matters for operators like `InterleaveExec`
-    /// above the reader that assert children share a hash partitioning to fuse
-    /// safely; downgrading to `UnknownPartitioning` breaks that assertion.
-    fn rewrite_shuffle_reader(
-        &mut self,
-        plan: &Arc<dyn ExecutionPlan>,
-    ) -> Option<Arc<dyn ExecutionPlan>> {
-        let reader = plan.downcast_ref::<ShuffleReaderExec>()?;
-        // Broadcast readers serve everything from partition[0] regardless of
-        // task; leave them intact.
-        if reader.broadcast {
-            self.scopes.pop();
+/// The `under_collect` value to pass to each child of `plan`.
+///
+/// - Once `under_collect` is set on the parent, it propagates unchanged to
+///   every child (it's sticky — descendants of a collapse all read
+///   everything).
+/// - `CoalescePartitionsExec` / `SortPreservingMergeExec`: set for all
+///   children.
+/// - `HashJoinExec` / `NestedLoopJoinExec`: set per child based on
+///   `required_input_distribution()`. Typically only the build side is
+///   `SinglePartition`, so the probe side inherits `false` and remains
+///   partition-aligned.
+/// - TODO(union): `UnionExec` needs per-child sub-ranges of `partitions`
+///   (the parent's partition indices map to disjoint index ranges across
+///   children). That's an orthogonal `Scope::ScopedPartitions(start, end)`
+///   variant on the DQE side; add it here when a query with a `UnionExec`
+///   under partition-aligned parents demands it. See the ignored test
+///   `restrict_union_splits_partitions_per_child` for the assertion we owe.
+fn child_scopes(plan: &Arc<dyn ExecutionPlan>, under_collect: bool) -> Vec<bool> {
+    let children = plan.children();
+    if under_collect {
+        return vec![true; children.len()];
+    }
+    if plan.is::<CoalescePartitionsExec>() || plan.is::<SortPreservingMergeExec>() {
+        return vec![true; children.len()];
+    }
+    if plan.is::<HashJoinExec>() || plan.is::<NestedLoopJoinExec>() {
+        return plan
+            .required_input_distribution()
+            .into_iter()
+            .map(|d| matches!(d, Distribution::SinglePartition))
+            .collect();
+    }
+    vec![false; children.len()]
+}
+
+/// Restrict a `ShuffleReaderExec` so only the assigned `partitions` remain
+/// in its `partition` vec — unless `under_collect` is true, in which case
+/// every upstream partition is preserved. Output_partitioning shrinks to
+/// `kept.len()` but **preserves the partitioning kind** — a `Hash([col], N)`
+/// reader becomes `Hash([col], kept.len())`, not `UnknownPartitioning`. This
+/// matters for operators like `InterleaveExec` above the reader that assert
+/// children share a hash partitioning to fuse safely.
+fn rewrite_shuffle_reader(
+    plan: &Arc<dyn ExecutionPlan>,
+    partitions: &[usize],
+    under_collect: bool,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    let reader = plan.downcast_ref::<ShuffleReaderExec>()?;
+    // Broadcast readers serve everything from partition[0] regardless of
+    // task; leave them intact regardless of scope.
+    if reader.broadcast {
+        return None;
+    }
+    let kept: Vec<Vec<_>> = if under_collect {
+        reader.partition.clone()
+    } else {
+        partitions
+            .iter()
+            .filter_map(|&p| reader.partition.get(p).cloned())
+            .collect()
+    };
+    let partitioning = match reader.properties().output_partitioning() {
+        datafusion::physical_plan::Partitioning::Hash(exprs, _) => {
+            datafusion::physical_plan::Partitioning::Hash(exprs.clone(), kept.len())
+        }
+        datafusion::physical_plan::Partitioning::RoundRobinBatch(_) => {
+            datafusion::physical_plan::Partitioning::RoundRobinBatch(kept.len())
+        }
+        datafusion::physical_plan::Partitioning::UnknownPartitioning(_) => {
+            datafusion::physical_plan::Partitioning::UnknownPartitioning(kept.len())
+        }
+    };
+    let restricted =
+        ShuffleReaderExec::try_new(reader.stage_id, kept, reader.schema(), partitioning)
+            .ok()?;
+    Some(Arc::new(restricted))
+}
+
+/// Restrict a `DataSourceExec` (file-backed or in-memory) so only the
+/// assigned `partitions` remain, or take all groups if `under_collect` is
+/// true. `output_partitioning().partition_count()` shrinks to
+/// `partitions.len()` — matching what `rewrite_shuffle_reader` does — so
+/// position `i` in the restricted plan corresponds to the task's
+/// `global_input_partition_ids[i]` globally.
+fn rewrite_scan(
+    plan: &Arc<dyn ExecutionPlan>,
+    partitions: &[usize],
+    under_collect: bool,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    let exec = plan.downcast_ref::<DataSourceExec>()?;
+    let source: &dyn Any = exec.data_source().as_ref();
+    if let Some(config) = source.downcast_ref::<FileScanConfig>() {
+        if under_collect {
             return None;
         }
-        let kept: Vec<Vec<_>> = match self.scopes.pop() {
-            // Under a collapse (Coalesce / SPM / single-partition join
-            // build): every task must see the full upstream so the collapse
-            // aggregates the complete partial-result set.
-            Some(Scope::Collect) => reader.partition.clone(),
-            None => self
-                .partitions
-                .iter()
-                .filter_map(|&p| reader.partition.get(p).cloned())
-                .collect(),
-        };
-        let partitioning = match reader.properties().output_partitioning() {
-            datafusion::physical_plan::Partitioning::Hash(exprs, _) => {
-                datafusion::physical_plan::Partitioning::Hash(exprs.clone(), kept.len())
-            }
-            datafusion::physical_plan::Partitioning::RoundRobinBatch(_) => {
-                datafusion::physical_plan::Partitioning::RoundRobinBatch(kept.len())
-            }
-            datafusion::physical_plan::Partitioning::UnknownPartitioning(_) => {
-                datafusion::physical_plan::Partitioning::UnknownPartitioning(kept.len())
-            }
-        };
-        let restricted = ShuffleReaderExec::try_new(
-            reader.stage_id,
-            kept,
-            reader.schema(),
-            partitioning,
+        let file_groups: Vec<FileGroup> = partitions
+            .iter()
+            .filter_map(|&i| config.file_groups.get(i).cloned())
+            .collect();
+        let restricted = FileScanConfigBuilder::from(config.clone())
+            .with_file_groups(file_groups)
+            .build();
+        return Some(DataSourceExec::from_data_source(restricted));
+    }
+    if let Some(config) = source.downcast_ref::<MemorySourceConfig>() {
+        if under_collect {
+            return None;
+        }
+        let kept: Vec<Vec<_>> = partitions
+            .iter()
+            .filter_map(|&i| config.partitions().get(i).cloned())
+            .collect();
+        let restricted = MemorySourceConfig::try_new(
+            &kept,
+            config.original_schema(),
+            config.projection().clone(),
         )
         .ok()?;
-        Some(Arc::new(restricted))
+        return Some(DataSourceExec::from_data_source(restricted));
     }
-
-    /// Restrict a `DataSourceExec` (file-backed or in-memory) so only the
-    /// assigned `partitions` remain, or take all groups if under a `Collect`
-    /// scope. `output_partitioning().partition_count()` shrinks to
-    /// `partitions.len()` — matching what `rewrite_shuffle_reader` does — so
-    /// position `i` in the restricted plan corresponds to the task's
-    /// `global_input_partition_ids[i]` globally.
-    fn rewrite_scan(
-        &mut self,
-        plan: &Arc<dyn ExecutionPlan>,
-    ) -> Option<Arc<dyn ExecutionPlan>> {
-        let exec = plan.downcast_ref::<DataSourceExec>()?;
-        let scope = self.scopes.pop();
-        let source: &dyn Any = exec.data_source().as_ref();
-        if let Some(config) = source.downcast_ref::<FileScanConfig>() {
-            let file_groups: Vec<FileGroup> = match scope {
-                Some(Scope::Collect) => return None,
-                None => self
-                    .partitions
-                    .iter()
-                    .filter_map(|&i| config.file_groups.get(i).cloned())
-                    .collect(),
-            };
-            let restricted = FileScanConfigBuilder::from(config.clone())
-                .with_file_groups(file_groups)
-                .build();
-            return Some(DataSourceExec::from_data_source(restricted));
-        }
-        if let Some(config) = source.downcast_ref::<MemorySourceConfig>() {
-            let kept: Vec<Vec<_>> = match scope {
-                Some(Scope::Collect) => return None,
-                None => self
-                    .partitions
-                    .iter()
-                    .filter_map(|&i| config.partitions().get(i).cloned())
-                    .collect(),
-            };
-            let restricted = MemorySourceConfig::try_new(
-                &kept,
-                config.original_schema(),
-                config.projection().clone(),
-            )
-            .ok()?;
-            return Some(DataSourceExec::from_data_source(restricted));
-        }
-        warn!(
-            "restrict_plan_to_partitions: unrecognised DataSourceExec source \
-             left unrestricted; if it distributes work from a shared queue, \
-             tasks would over-read"
-        );
-        None
-    }
+    warn!(
+        "restrict_plan_to_partitions: unrecognised DataSourceExec source \
+         left unrestricted; if it distributes work from a shared queue, \
+         tasks would over-read"
+    );
+    None
 }
