@@ -105,8 +105,8 @@ pub struct SortShuffleWriterExec {
     job_id: JobId,
     /// Unique query stage ID within the job
     stage_id: usize,
-    /// Physical execution plan for this query stage
-    plan: Arc<dyn ExecutionPlan>,
+    /// Physical execution plan for this query stage, excluding the writer itself
+    child: Arc<dyn ExecutionPlan>,
     /// Path to write output streams to
     work_dir: String,
     /// Shuffle output partitioning (must be Hash partitioning)
@@ -137,7 +137,7 @@ impl Clone for SortShuffleWriterExec {
         Self {
             job_id: self.job_id.clone(),
             stage_id: self.stage_id,
-            plan: self.plan.clone(),
+            child: self.child.clone(),
             work_dir: self.work_dir.clone(),
             shuffle_output_partitioning: self.shuffle_output_partitioning.clone(),
             config: self.config.clone(),
@@ -221,7 +221,7 @@ impl SortShuffleWriterExec {
         Ok(Self {
             job_id,
             stage_id,
-            plan,
+            child: plan,
             work_dir,
             shuffle_output_partitioning,
             config,
@@ -283,7 +283,7 @@ impl SortShuffleWriterExec {
 
     /// Get the input partition count
     pub fn input_partition_count(&self) -> usize {
-        self.plan
+        self.child
             .properties()
             .output_partitioning()
             .partition_count()
@@ -309,7 +309,7 @@ impl SortShuffleWriterExec {
         context: Arc<TaskContext>,
     ) -> impl Future<Output = Result<Vec<(usize, ShuffleWritePartition)>>> {
         let config = self.config.clone();
-        let plan = self.plan.clone();
+        let plan = self.child.clone();
         let work_dir = self.work_dir.clone();
         let job_id = self.job_id.clone();
         let stage_id = self.stage_id;
@@ -737,7 +737,7 @@ impl ExecutionPlan for SortShuffleWriterExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.plan.schema()
+        self.child.schema()
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -745,7 +745,7 @@ impl ExecutionPlan for SortShuffleWriterExec {
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.plan]
+        vec![&self.child]
     }
 
     fn with_new_children(
@@ -861,7 +861,7 @@ impl ExecutionPlan for SortShuffleWriterExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.plan.partition_statistics(partition)
+        self.child.partition_statistics(partition)
     }
 }
 
@@ -879,7 +879,7 @@ impl ShuffleWriter for SortShuffleWriterExec {
     }
 
     fn input_partition_count(&self) -> usize {
-        self.plan
+        self.child
             .properties()
             .output_partitioning()
             .partition_count()
@@ -936,7 +936,7 @@ async fn run_coordinator(
 
 impl std::fmt::Display for SortShuffleWriterExec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let printable_plan = displayable(self.plan.as_ref())
+        let printable_plan = displayable(self.child.as_ref())
             .set_show_statistics(true)
             .indent(false);
         write!(
