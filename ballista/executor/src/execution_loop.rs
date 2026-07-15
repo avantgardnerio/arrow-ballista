@@ -281,8 +281,11 @@ async fn run_received_task<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
             proto.try_into_physical_plan(&task_context, codec.physical_extension_codec())
         })?;
 
-    let global_output_partition_ids: Vec<usize> =
-        task.global_output_partition_ids.iter().map(|p| *p as usize).collect();
+    let global_output_partition_ids: Vec<usize> = task
+        .global_output_partition_ids
+        .iter()
+        .map(|p| *p as usize)
+        .collect();
 
     let query_stage_exec = executor.execution_engine.create_query_stage_exec(
         job_id.clone(),

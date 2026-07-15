@@ -2216,7 +2216,10 @@ mod test {
         // retried" — assert on that instead of task_index.
         for attempt in 1..5 {
             if let Some(task2_attempt) = agg_graph.pop_next_task(&executor.id)? {
-                assert_eq!(task2_attempt.global_input_partition_ids, task2.global_input_partition_ids);
+                assert_eq!(
+                    task2_attempt.global_input_partition_ids,
+                    task2.global_input_partition_ids
+                );
                 assert_eq!(task2_attempt.task_attempt, attempt);
                 last_attempt = task2_attempt.task_attempt;
                 let task_status = mock_failed_task(

@@ -264,7 +264,10 @@ impl SortShuffleWriterExec {
     /// `global_output_partition_ids[i]` gives the global id of the child plan's local
     /// input partition `i`; the sort writer uses this to name each per-input
     /// output file so different tasks in the stage don't collide.
-    pub fn with_global_output_partition_ids(mut self, global_output_partition_ids: Vec<usize>) -> Self {
+    pub fn with_global_output_partition_ids(
+        mut self,
+        global_output_partition_ids: Vec<usize>,
+    ) -> Self {
         self.global_output_partition_ids = global_output_partition_ids;
         self
     }
@@ -474,7 +477,7 @@ async fn drain_one_input_partition(
     metrics_set: ExecutionPlanMetricsSet,
 ) -> Result<PipelineDrainState> {
     let _ = metrics_set; // reserved for future per-pipeline metrics; task-level
-                         // metrics live in finalize_task_output.
+    // metrics live in finalize_task_output.
     let mut stream = plan.execute(local_input_partition, context.clone())?;
     let schema = stream.schema();
 
@@ -714,8 +717,11 @@ fn finalize_task_output(
                     bucket_indices,
                     config.batch_size,
                 );
-                let mut writer =
-                    StreamWriter::try_new_with_options(&mut output, schema, opts.clone())?;
+                let mut writer = StreamWriter::try_new_with_options(
+                    &mut output,
+                    schema,
+                    opts.clone(),
+                )?;
                 for result in iter {
                     let batch = result?;
                     bucket_stats[bucket].0 += 1;
@@ -750,8 +756,7 @@ fn finalize_task_output(
         total_input_rows += state.input_rows as usize;
         total_spill_events += state.spill_events as usize;
         total_spill_bytes = total_spill_bytes.saturating_add(state.spill_bytes);
-        total_repart_nanos =
-            total_repart_nanos.saturating_add(state.repart_time_nanos);
+        total_repart_nanos = total_repart_nanos.saturating_add(state.repart_time_nanos);
         total_spill_nanos = total_spill_nanos.saturating_add(state.spill_time_nanos);
         state
             .spill_manager
@@ -861,7 +866,9 @@ impl ExecutionPlan for SortShuffleWriterExec {
                     self.config.clone(),
                 )?
                 .with_task_index(self.task_index)
-                .with_global_output_partition_ids(self.global_output_partition_ids.clone()),
+                .with_global_output_partition_ids(
+                    self.global_output_partition_ids.clone(),
+                ),
             ))
         } else {
             Err(DataFusionError::Plan(

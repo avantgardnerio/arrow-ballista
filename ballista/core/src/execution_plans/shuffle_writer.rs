@@ -35,8 +35,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::JobId;
-use crate::execution_plans::create_shuffle_path;
 use crate::execution_plans::SortShuffleWriterExec;
+use crate::execution_plans::create_shuffle_path;
 use crate::extension::SessionConfigExt;
 use crate::utils;
 
@@ -175,17 +175,22 @@ pub fn compute_global_output_partition_ids(
     }
     if let Some(w) = stage_plan.downcast_ref::<ShuffleWriterExec>() {
         match w.shuffle_output_partitioning() {
-            Some(Partitioning::Hash(_, k))
-            | Some(Partitioning::RoundRobinBatch(k)) => return (0..*k).collect(),
+            Some(Partitioning::Hash(_, k)) | Some(Partitioning::RoundRobinBatch(k)) => {
+                return (0..*k).collect();
+            }
             None => {
                 let children = stage_plan.children();
                 let [child] = children.as_slice() else {
                     unreachable!("ShuffleWriterExec always has exactly one child");
                 };
-                return match walk_child_partition_mapping(child, global_input_partition_ids) {
+                return match walk_child_partition_mapping(
+                    child,
+                    global_input_partition_ids,
+                ) {
                     GlobalPartitionMap::Collapsed => vec![0],
                     GlobalPartitionMap::HashSpace => {
-                        let k = child.properties().output_partitioning().partition_count();
+                        let k =
+                            child.properties().output_partitioning().partition_count();
                         (0..k).collect()
                     }
                     GlobalPartitionMap::PassThrough(ids) => ids,
@@ -407,7 +412,10 @@ impl ShuffleWriterExec {
     }
 
     /// Bind this writer to the task's assigned global partition slice.
-    pub fn with_global_output_partition_ids(mut self, global_output_partition_ids: Vec<usize>) -> Self {
+    pub fn with_global_output_partition_ids(
+        mut self,
+        global_output_partition_ids: Vec<usize>,
+    ) -> Self {
         self.global_output_partition_ids = global_output_partition_ids;
         self
     }
@@ -459,7 +467,8 @@ impl ShuffleWriterExec {
         let write_metrics = ShuffleWriteMetrics::new(task_index, &self.metrics);
         let output_partitioning = self.shuffle_output_partitioning.clone();
         let plan = self.plan.clone();
-        let partition_map = walk_child_partition_mapping(&plan, &self.global_output_partition_ids);
+        let partition_map =
+            walk_child_partition_mapping(&plan, &self.global_output_partition_ids);
 
         async move {
             let now = Instant::now();
@@ -768,7 +777,9 @@ impl ExecutionPlan for ShuffleWriterExec {
                     self.shuffle_output_partitioning.clone(),
                 )?
                 .with_task_index(self.task_index)
-                .with_global_output_partition_ids(self.global_output_partition_ids.clone()),
+                .with_global_output_partition_ids(
+                    self.global_output_partition_ids.clone(),
+                ),
             ))
         } else {
             Err(DataFusionError::Plan(
