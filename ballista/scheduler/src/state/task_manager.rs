@@ -28,6 +28,7 @@ use crate::state::executor_manager::ExecutorManager;
 use crate::state::task_builder::restrict_plan_to_partitions;
 use ballista_core::error::BallistaError;
 use ballista_core::error::Result;
+use ballista_core::execution_plans::compute_global_output_partition_ids;
 use ballista_core::extension::{SessionConfigExt, SessionConfigHelperExt};
 use ballista_core::serde::BallistaCodec;
 use ballista_core::serde::protobuf::{
@@ -725,14 +726,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                     .unwrap()
                     .as_millis() as u64,
                 props: task.session_config.to_key_value_pairs(),
-                // output ids _are_ input ids in passthrough partitioning
-                // mode. All other modes (hash, single) will ignore this
-                // field.
-                global_output_partition_ids: task
-                    .global_input_partition_ids
-                    .iter()
-                    .map(|p| *p as u32)
-                    .collect(),
+                global_output_partition_ids: compute_global_output_partition_ids(
+                    &task.plan,
+                    &task.global_input_partition_ids,
+                )
+                .into_iter()
+                .map(|p| p as u32)
+                .collect(),
             };
             Ok(task_definition)
         } else {
@@ -819,14 +819,13 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 task_id: task.task_id as u32,
                 task_attempt_num: task.task_attempt as u32,
                 task_index: task.key.task_index as u32,
-                // output ids _are_ input ids in passthrough partitioning
-                // mode. All other modes (hash, single) will ignore this
-                // field.
-                global_output_partition_ids: task
-                    .global_input_partition_ids
-                    .iter()
-                    .map(|p| *p as u32)
-                    .collect(),
+                global_output_partition_ids: compute_global_output_partition_ids(
+                    &task.plan,
+                    &task.global_input_partition_ids,
+                )
+                .into_iter()
+                .map(|p| p as u32)
+                .collect(),
             }];
             multi_tasks.push(MultiTaskDefinition {
                 task_ids,

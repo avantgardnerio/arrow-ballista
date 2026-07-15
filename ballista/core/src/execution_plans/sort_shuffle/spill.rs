@@ -21,7 +21,6 @@
 //! At finalization, the spill bytes are concatenated verbatim into the
 //! consolidated output file alongside the in-memory remainder.
 
-use crate::JobId;
 use crate::error::{BallistaError, Result};
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::ipc::reader::StreamReader;
@@ -63,29 +62,24 @@ pub struct SpillManager {
 }
 
 impl SpillManager {
-    /// Creates a new spill manager.
+    /// Creates a new spill manager rooted at a caller-provided directory.
+    ///
+    /// Under a multi-partition task the caller composes a unique dir per
+    /// (task, pipeline) — e.g.
+    /// `{work_dir}/{job_id}/{stage_id}/{task_index}/{local_input_partition}/spill/`
+    /// — so concurrent pipelines within a task don't share writers, and
+    /// tasks across the stage don't collide either.
     ///
     /// # Arguments
-    /// * `work_dir` - Base work directory
-    /// * `job_id` - Job identifier
-    /// * `stage_id` - Stage identifier
-    /// * `input_partition` - Input partition number
+    /// * `spill_dir` - Directory to hold per-partition spill files. Created
+    ///   if it doesn't exist.
     /// * `schema` - Schema shared by all spill writers
     /// * `compression` - Compression codec for spill files
     pub fn new(
-        work_dir: &str,
-        job_id: &JobId,
-        stage_id: usize,
-        input_partition: usize,
+        spill_dir: PathBuf,
         schema: SchemaRef,
         compression: CompressionType,
     ) -> Result<Self> {
-        let mut spill_dir = PathBuf::from(work_dir);
-        spill_dir.push(job_id.as_str());
-        spill_dir.push(format!("{stage_id}"));
-        spill_dir.push(format!("{input_partition}"));
-        spill_dir.push("spill");
-
         std::fs::create_dir_all(&spill_dir).map_err(BallistaError::IoError)?;
 
         Ok(Self {
@@ -273,10 +267,7 @@ mod tests {
         let schema = create_test_schema();
 
         let mut manager = SpillManager::new(
-            temp_dir.path().to_str().unwrap(),
-            &"job1".into(),
-            1,
-            0,
+            temp_dir.path().join("spill"),
             schema.clone(),
             CompressionType::LZ4_FRAME,
         )?;
@@ -308,10 +299,7 @@ mod tests {
         let schema = create_test_schema();
 
         let mut manager = SpillManager::new(
-            temp_dir.path().to_str().unwrap(),
-            &"job1".into(),
-            1,
-            0,
+            temp_dir.path().join("spill"),
             schema.clone(),
             CompressionType::LZ4_FRAME,
         )?;
@@ -345,10 +333,7 @@ mod tests {
         let schema = create_test_schema();
 
         let mut manager = SpillManager::new(
-            temp_dir.path().to_str().unwrap(),
-            &"job1".into(),
-            1,
-            0,
+            temp_dir.path().join("spill"),
             schema.clone(),
             CompressionType::LZ4_FRAME,
         )?;
@@ -391,10 +376,7 @@ mod tests {
         let schema = create_test_schema();
 
         let mut manager = SpillManager::new(
-            temp_dir.path().to_str().unwrap(),
-            &"job1".into(),
-            1,
-            0,
+            temp_dir.path().join("spill"),
             schema.clone(),
             CompressionType::LZ4_FRAME,
         )?;

@@ -36,6 +36,7 @@ use std::time::Instant;
 
 use crate::JobId;
 use crate::execution_plans::create_shuffle_path;
+use crate::execution_plans::SortShuffleWriterExec;
 use crate::extension::SessionConfigExt;
 use crate::utils;
 
@@ -140,6 +141,65 @@ fn walk_child_partition_mapping(
         return walk_child_partition_mapping(children[0], global_output_partition_ids);
     }
     GlobalPartitionMap::PassThrough(global_output_partition_ids.to_vec())
+}
+
+/// Compute the set of global output partition ids a task's writer will
+/// produce, given the global *input* partition ids the task consumes.
+///
+/// This is called on the scheduler when preparing a `TaskDefinition` for
+/// the wire. The executor-side writer then uses these ids directly rather
+/// than re-walking the plan.
+///
+/// Three cases:
+///
+/// - `SortShuffleWriter(Hash(K))` — HashSpace by construction; the K-space
+///   `[0..K-1]` is intrinsic. Input ids are irrelevant.
+/// - `ShuffleWriter(Hash(K)|RoundRobin(K))` — same K-space semantics.
+/// - `ShuffleWriter(None)` — passthrough; the child's plan shape decides:
+///   - `SortPreservingMergeExec` in the child chain → `[0]` (collapse).
+///   - `RepartitionExec(Hash|RoundRobin)` in the child chain → `[0..K-1]`.
+///   - Otherwise (leaf-preserved partitioning) → the input ids as-is.
+///
+/// Any other plan root is treated as a passthrough of the input ids —
+/// this is the compat crutch for tests and codepaths that call the
+/// helper without a real writer at the root.
+pub fn compute_global_output_partition_ids(
+    stage_plan: &Arc<dyn ExecutionPlan>,
+    global_input_partition_ids: &[usize],
+) -> Vec<usize> {
+    if let Some(w) = stage_plan.downcast_ref::<SortShuffleWriterExec>() {
+        let Partitioning::Hash(_, k) = w.shuffle_output_partitioning() else {
+            unreachable!("SortShuffleWriterExec is Hash-partitioned by construction");
+        };
+        return (0..*k).collect();
+    }
+    if let Some(w) = stage_plan.downcast_ref::<ShuffleWriterExec>() {
+        match w.shuffle_output_partitioning() {
+            Some(Partitioning::Hash(_, k))
+            | Some(Partitioning::RoundRobinBatch(k)) => return (0..*k).collect(),
+            None => {
+                let children = stage_plan.children();
+                let [child] = children.as_slice() else {
+                    unreachable!("ShuffleWriterExec always has exactly one child");
+                };
+                return match walk_child_partition_mapping(child, global_input_partition_ids) {
+                    GlobalPartitionMap::Collapsed => vec![0],
+                    GlobalPartitionMap::HashSpace => {
+                        let k = child.properties().output_partitioning().partition_count();
+                        (0..k).collect()
+                    }
+                    GlobalPartitionMap::PassThrough(ids) => ids,
+                };
+            }
+            Some(Partitioning::UnknownPartitioning(_)) => {
+                panic!(
+                    "ShuffleWriterExec::UnknownPartitioning has no meaningful output-id \
+                     space; upstream planner should never emit this shape"
+                );
+            }
+        }
+    }
+    global_input_partition_ids.to_vec()
 }
 
 /// Default bounded-channel capacity for the async-to-blocking I/O bridge.

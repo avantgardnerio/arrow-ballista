@@ -17,9 +17,21 @@
 
 //! Sort-based shuffle writer execution plan.
 //!
-//! This execution plan writes shuffle output as a single consolidated file
-//! per input partition, along with an index file mapping partition IDs to
-//! byte offsets.
+//! Under a multi-partition task this writer produces **one output file per
+//! task**, at `.../{stage}/{task_index}/data.arrow` with a sibling
+//! `.index` file giving byte offsets for each of the K output partitions
+//! (hash buckets) inside. Pipelines (one per input partition of the
+//! restricted child plan) drain concurrently into per-pipeline in-memory
+//! buffers and per-pipeline spill files; at finalize the buffered +
+//! spilled contributions are concatenated into the single task-level file,
+//! bucket by bucket.
+//!
+//! In the 1-task-per-partition mode (Spark-compat), the number of files
+//! per stage is unchanged from the old per-input-partition layout — the
+//! task has one pipeline and writes one file. In multi-partition-task
+//! mode the file count drops from N (input partitions) to N/task_size
+//! (tasks), which downstream reads as fewer, larger contributions to each
+//! output partition.
 
 use std::fmt::Debug;
 use std::fs::File;
@@ -62,10 +74,6 @@ use datafusion::physical_plan::{
 use futures::{StreamExt, TryStreamExt};
 use log::debug;
 
-/// Result of finalizing shuffle output: (data_path, index_path, partition_write_stats)
-/// where partition_write_stats is (partition_id, num_batches, num_rows, num_bytes)
-type FinalizeResult = (PathBuf, PathBuf, Vec<(usize, u64, u64, u64)>);
-
 /// Coordinator handoff state — same shape as `ShuffleWriterExec`. Each output
 /// hash partition (0..K) gets one `oneshot::Receiver`; the first `execute(N)`
 /// call spawns the coordinator, subsequent calls take their receiver and
@@ -84,21 +92,24 @@ impl Debug for WriterState {
     }
 }
 
-/// Sort-based shuffle writer that produces one consolidated output file per
-/// input partition (each with a `.index` sibling giving byte offsets for the K
-/// output partitions inside).
+/// Sort-based shuffle writer that produces one task-level output file with
+/// K output-partition sections (hash buckets) and a sibling `.index` giving
+/// per-bucket byte offsets.
 ///
-/// Under a multi-partition task the writer runs one pipeline per input
-/// partition of its (scheduler-side-shrink-restricted) child plan
-/// concurrently — same coordinator+oneshot handoff as `ShuffleWriterExec`.
-/// `execute(N)` for output hash bucket N gets a Vec of summaries (one per
-/// input file this task drained).
+/// Runs one pipeline per input partition of its (scheduler-side-shrink-
+/// restricted) child plan concurrently. Each pipeline drains one input
+/// partition into per-bucket buffers, spilling to per-pipeline files under
+/// memory pressure. At finalize the task's finalizer walks buckets 0..K,
+/// concatenating each pipeline's spilled + buffered contribution for that
+/// bucket into a single output file. Cross-task file uniqueness is
+/// provided by `task_index` alone; `global_output_partition_ids` is used
+/// only as a guard sanity-check (K-space is intrinsic to this writer).
 ///
-/// Output partition ids in summaries are the K-space hash buckets, which are
-/// inherently global — no plan-walk needed. `global_output_partition_ids` is used only
-/// as the file-naming disambiguator: `file_id = global_output_partition_ids[local_input]`
-/// gives each file a global input partition id, and since slices are disjoint
-/// across the stage's tasks, files never collide across tasks.
+/// Coordinator+oneshot handoff mirrors `ShuffleWriterExec`: the first
+/// `execute(N)` call spawns a coordinator that drives every pipeline and
+/// then finalizes the merged file; subsequent `execute(N)` calls take
+/// their `oneshot::Receiver` and await the summaries for output partition
+/// N.
 #[derive(Debug)]
 pub struct SortShuffleWriterExec {
     /// Unique ID for the job (query) that this stage is a part of
@@ -213,11 +224,13 @@ impl SortShuffleWriterExec {
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         ));
 
-        // TODO: kill the default-identity slice. Same compat crutch as
-        // `ShuffleWriterExec::try_new`.
-        let child_partition_count =
-            plan.properties().output_partitioning().partition_count();
-        let default_partition_slice: Vec<usize> = (0..child_partition_count).collect();
+        // Default output-id identity: `[0..K-1]`. SortShuffle is a HashSpace
+        // producer, so the K-space is intrinsic to the writer's own
+        // partitioning. Callers can override via
+        // [`with_global_output_partition_ids`] but the default lets tests
+        // and proto-decoded plans construct usable writers.
+        let default_global_output_partition_ids: Vec<usize> =
+            (0..output_partition_count).collect();
         Ok(Self {
             job_id,
             stage_id,
@@ -226,7 +239,7 @@ impl SortShuffleWriterExec {
             shuffle_output_partitioning,
             config,
             task_index: 0,
-            global_output_partition_ids: default_partition_slice,
+            global_output_partition_ids: default_global_output_partition_ids,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
             state: Arc::new(Mutex::new(WriterState {
@@ -291,19 +304,24 @@ impl SortShuffleWriterExec {
 
     /// Executes the sort-based shuffle write for this task.
     ///
-    /// One pipeline per input partition of the (scheduler-side-shrink-restricted)
-    /// child plan runs concurrently. Each drains one input partition into its
-    /// own file at `.../{stage}/{global_input_partition}/data.arrow` +
-    /// `.index`, where `global_input_partition = global_output_partition_ids[local]`.
-    /// Because slices are disjoint across the stage's tasks, no cross-task
-    /// path collisions can happen. Per-pipeline memory budget is
+    /// One pipeline per input partition of the (scheduler-side-shrink-
+    /// restricted) child plan runs concurrently. Each pipeline drains one
+    /// input partition into per-bucket in-memory buffers and per-pipeline
+    /// spill files, then returns its accumulated state. After every
+    /// pipeline finishes, [`finalize_task_output`] concatenates their
+    /// per-bucket contributions into **one** task-level file at
+    /// `.../{stage}/{task_index}/data.arrow` (+`.index`) — bucket b's
+    /// section is the sequential union of every pipeline's bucket-b
+    /// spilled bytes followed by its buffered batches.
+    ///
+    /// Per-pipeline memory budget is
     /// `memory_limit_per_task_bytes / num_input_partitions` so peak memory
-    /// across all pipelines matches the configured per-task budget.
+    /// across all pipelines still matches the configured per-task budget.
     ///
     /// Returns `(handoff_idx, summary)` pairs. `handoff_idx` is the output
     /// hash bucket (0..K, matching the coordinator's oneshot slots);
     /// `summary.partition_id` is the same hash bucket (inherently global);
-    /// `file_id` is the global input partition id.
+    /// `file_id = task_index` gives the task-level file downstream reads.
     pub fn execute_shuffle_write(
         self,
         context: Arc<TaskContext>,
@@ -313,6 +331,7 @@ impl SortShuffleWriterExec {
         let work_dir = self.work_dir.clone();
         let job_id = self.job_id.clone();
         let stage_id = self.stage_id;
+        let task_index = self.task_index;
         let partitioning = self.shuffle_output_partitioning.clone();
         let global_output_partition_ids = self.global_output_partition_ids.clone();
         let metrics_set = self.metrics.clone();
@@ -324,16 +343,21 @@ impl SortShuffleWriterExec {
                 ));
             };
 
-            let num_input_partitions =
-                plan.properties().output_partitioning().partition_count();
-
-            if num_input_partitions != global_output_partition_ids.len() {
+            // Guard: this writer is a HashSpace producer, so its output-id
+            // space is intrinsically [0..K-1]. The wire must have delivered
+            // that shape. (This replaces the old
+            // `num_input_partitions == slice.len()` check, which conflated
+            // input and output namespaces.)
+            if global_output_partition_ids.len() != num_output_partitions {
                 return Err(DataFusionError::Internal(format!(
-                    "SortShuffleWriterExec plan reports {num_input_partitions} \
-                     partitions but global_output_partition_ids has {}",
+                    "SortShuffleWriterExec expects one global output id per \
+                     hash bucket (K={num_output_partitions}); got {}",
                     global_output_partition_ids.len()
                 )));
             }
+
+            let num_input_partitions =
+                plan.properties().output_partitioning().partition_count();
 
             if num_input_partitions == 0 {
                 return Ok(Vec::new());
@@ -347,9 +371,7 @@ impl SortShuffleWriterExec {
             );
 
             let mut handles = Vec::with_capacity(num_input_partitions);
-            for (local_input_partition, &global_input_partition) in
-                global_output_partition_ids.iter().enumerate()
-            {
+            for local in 0..num_input_partitions {
                 let plan = plan.clone();
                 let ctx = context.clone();
                 let work_dir = work_dir.clone();
@@ -358,11 +380,11 @@ impl SortShuffleWriterExec {
                 let config = config.clone();
                 let metrics_set = metrics_set.clone();
                 handles.push(tokio::spawn(async move {
-                    run_one_input_partition(
+                    drain_one_input_partition(
                         plan,
                         ctx,
-                        local_input_partition,
-                        global_input_partition,
+                        local,
+                        task_index,
                         work_dir,
                         job_id,
                         stage_id,
@@ -376,37 +398,72 @@ impl SortShuffleWriterExec {
                 }));
             }
 
-            let mut all_summaries = Vec::new();
+            let mut pipeline_states = Vec::with_capacity(num_input_partitions);
             for handle in handles {
-                let per_pipeline = handle.await.map_err(|e| {
+                let state = handle.await.map_err(|e| {
                     DataFusionError::Execution(format!(
                         "sort-shuffle-write pipeline panicked: {e}"
                     ))
                 })??;
-                all_summaries.extend(per_pipeline);
+                pipeline_states.push(state);
             }
-            Ok(all_summaries)
+
+            let schema = plan.schema();
+            finalize_task_output(
+                &work_dir,
+                &job_id,
+                stage_id,
+                task_index,
+                pipeline_states,
+                num_output_partitions,
+                &schema,
+                &config,
+                &metrics_set,
+            )
         }
     }
 }
 
-/// One sort-shuffle-write pipeline: drain input partition `local_input_partition`
-/// of `plan` (its global identity is `global_input_partition`), hash-scatter
-/// rows into K logical output partitions, spill under memory pressure, and
-/// finalize into `.../{stage}/{global_input_partition}/data.arrow` +
-/// `.index`.
+/// Accumulated state from one drained input partition, handed to
+/// [`finalize_task_output`] for merging into the task-level output file.
+/// Drain only accumulates counters; all metric writes happen once at the
+/// task level in finalize to avoid double-counting into the shared
+/// `MetricsSet` when task_index and a local partition index collide.
+struct PipelineDrainState {
+    /// In-memory per-bucket buffered batches that never spilled.
+    buffered: BufferedBatches,
+    /// Per-bucket spill files this pipeline wrote under memory pressure.
+    spill_manager: SpillManager,
+    /// Held for the pipeline lifetime so the runtime pool sees memory
+    /// pressure while draining. Dropped when the state is consumed by
+    /// finalize.
+    _reservation: MemoryReservation,
+    /// Total rows read from `plan.execute(local)`.
+    input_rows: u64,
+    /// Number of memory-pressure spill events this pipeline triggered.
+    spill_events: u64,
+    /// Cumulative spill bytes across this pipeline's events.
+    spill_bytes: u64,
+    /// Sum of per-batch repartition times measured during drain.
+    repart_time_nanos: u64,
+    /// Sum of per-spill spill times measured during drain.
+    spill_time_nanos: u64,
+}
+
+/// One sort-shuffle-write pipeline: drain input partition
+/// `local_input_partition` of `plan`, hash-scatter rows into K in-memory
+/// buckets, and spill under memory pressure to per-pipeline files at
+/// `.../{stage}/{task_index}/{local_input_partition}/spill/`.
 ///
-/// Returns K `(handoff_idx=output_partition, summary)` pairs — one per output
-/// partition that this file contributed to. Empty output partitions still
-/// emit a zero-content summary so the coordinator can dispatch to every slot;
-/// `drive_shuffle_writer_stage` strips zero-content entries before the
-/// scheduler ingests them.
+/// Does *not* finalize an output file — that's [`finalize_task_output`]'s
+/// job, which merges every pipeline's (spilled + buffered) contribution
+/// into one task-level file with K sections.
 #[allow(clippy::too_many_arguments)]
-async fn run_one_input_partition(
+async fn drain_one_input_partition(
     plan: Arc<dyn ExecutionPlan>,
     context: Arc<TaskContext>,
     local_input_partition: usize,
-    global_input_partition: usize,
+    task_index: usize,
     work_dir: String,
     job_id: JobId,
     stage_id: usize,
@@ -415,31 +472,35 @@ async fn run_one_input_partition(
     config: SortShuffleConfig,
     memory_limit: usize,
     metrics_set: ExecutionPlanMetricsSet,
-) -> Result<Vec<(usize, ShuffleWritePartition)>> {
-    let metrics = SortShuffleWriteMetrics::new(local_input_partition, &metrics_set);
-    let now = Instant::now();
+) -> Result<PipelineDrainState> {
+    let _ = metrics_set; // reserved for future per-pipeline metrics; task-level
+                         // metrics live in finalize_task_output.
     let mut stream = plan.execute(local_input_partition, context.clone())?;
     let schema = stream.schema();
 
-    let mut spill_manager = SpillManager::new(
-        &work_dir,
-        &job_id,
-        stage_id,
-        global_input_partition,
-        schema.clone(),
-        config.compression,
-    )
-    .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+    let mut spill_dir = PathBuf::from(&work_dir);
+    spill_dir.push(job_id.as_str());
+    spill_dir.push(format!("{stage_id}"));
+    spill_dir.push(format!("{task_index}"));
+    spill_dir.push(format!("{local_input_partition}"));
+    spill_dir.push("spill");
+    let mut spill_manager =
+        SpillManager::new(spill_dir, schema.clone(), config.compression)
+            .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
 
     let mut buffered = BufferedBatches::new(num_output_partitions, schema.clone());
 
-    let mut reservation =
-        MemoryConsumer::new(format!("SortShuffleWriter[{global_input_partition}]"))
-            .with_can_spill(true)
-            .register(&context.runtime_env().memory_pool);
+    let mut reservation = MemoryConsumer::new(format!(
+        "SortShuffleWriter[task={task_index},local={local_input_partition}]"
+    ))
+    .with_can_spill(true)
+    .register(&context.runtime_env().memory_pool);
 
     let mut hash_buffer: Vec<u64> = Vec::new();
+    let mut input_rows: u64 = 0;
     let mut spill_events: u64 = 0;
+    let mut repart_time_nanos: u64 = 0;
+    let mut spill_time_nanos: u64 = 0;
     // Absolute buffered-bytes counter, independent of the runtime `MemoryPool`.
     // Drives spill decisions so the writer bounds its RSS even when the pool
     // is unbounded.
@@ -447,17 +508,19 @@ async fn run_one_input_partition(
 
     while let Some(result) = stream.next().await {
         let input_batch = result?;
-        metrics.input_rows.add(input_batch.num_rows());
+        let batch_rows = input_batch.num_rows() as u64;
+        input_rows += batch_rows;
 
         // Compute partition assignment for every row.
-        let timer = metrics.repart_time.timer();
+        let repart_start = Instant::now();
         let per_partition_rows = compute_partition_indices(
             &input_batch,
             &exprs,
             num_output_partitions,
             &mut hash_buffer,
         )?;
-        timer.done();
+        repart_time_nanos =
+            repart_time_nanos.saturating_add(repart_start.elapsed().as_nanos() as u64);
 
         // Estimate memory growth: input batch + index Vec growth.
         let mut growth = input_batch.get_array_memory_size();
@@ -474,29 +537,26 @@ async fn run_one_input_partition(
         buffered_bytes = buffered_bytes.saturating_add(growth);
 
         if buffered_bytes >= memory_limit {
-            let spill_timer = metrics.spill_time.timer();
+            let spill_start = Instant::now();
             let (event_batches, event_bytes) = spill_all_partitions(
                 &mut buffered,
                 &mut spill_manager,
                 &mut reservation,
                 config.batch_size,
             )?;
-            spill_timer.done();
+            spill_time_nanos =
+                spill_time_nanos.saturating_add(spill_start.elapsed().as_nanos() as u64);
             buffered_bytes = 0;
 
             if event_batches > 0 {
                 spill_events += 1;
                 debug!(
-                    "Sort shuffle writer for input partition {} spilled \
-                     event #{}: {} batches, {} bytes \
-                     (cumulative: {} events, {} batches, {} bytes)",
-                    global_input_partition,
-                    spill_events,
-                    event_batches,
-                    event_bytes,
-                    spill_events,
-                    spill_manager.total_spilled_batches(),
-                    spill_manager.total_bytes_spilled(),
+                    "Sort shuffle pipeline task={task_index} local={local_input_partition} \
+                     spilled event #{spill_events}: {event_batches} batches, {event_bytes} \
+                     bytes (cumulative: {events} events, {batches} batches, {bytes} bytes)",
+                    events = spill_events,
+                    batches = spill_manager.total_spilled_batches(),
+                    bytes = spill_manager.total_bytes_spilled(),
                 );
             }
         }
@@ -507,68 +567,18 @@ async fn run_one_input_partition(
         .finish_writers()
         .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
 
-    let timer = metrics.write_time.timer();
-    let (data_path, index_path, partition_stats) = finalize_output(
-        &work_dir,
-        &job_id,
-        stage_id,
-        global_input_partition,
-        &mut buffered,
-        &mut spill_manager,
-        &schema,
-        &config,
-    )?;
-    timer.done();
+    let spill_bytes = spill_manager.total_bytes_spilled();
 
-    metrics.spill_count.add(spill_events as usize);
-    metrics
-        .spill_bytes
-        .add(spill_manager.total_bytes_spilled() as usize);
-
-    let total_rows: u64 = partition_stats.iter().map(|(_, _, r, _)| *r).sum();
-    metrics.output_rows.add(total_rows as usize);
-
-    // Snapshot spill counters before cleanup (cleanup doesn't touch them but
-    // we want to be explicit about ordering for the log line below).
-    let total_spilled_batches = spill_manager.total_spilled_batches();
-    let total_bytes_spilled = spill_manager.total_bytes_spilled();
-
-    spill_manager
-        .cleanup()
-        .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
-
-    // Reservation drops naturally; nothing left to free.
-    drop(reservation);
-
-    debug!(
-        "Sort shuffle write for partition {} completed in {} seconds. \
-         Output: {:?}, Index: {:?}, Spill events: {}, Spill batches: {}, \
-         Spill bytes: {}",
-        global_input_partition,
-        now.elapsed().as_secs(),
-        data_path,
-        index_path,
+    Ok(PipelineDrainState {
+        buffered,
+        spill_manager,
+        _reservation: reservation,
+        input_rows,
         spill_events,
-        total_spilled_batches,
-        total_bytes_spilled
-    );
-
-    let mut results = Vec::with_capacity(partition_stats.len());
-    for (part_id, num_batches, num_rows, num_bytes) in partition_stats {
-        results.push((
-            part_id,
-            ShuffleWritePartition {
-                partition_id: part_id as u64,
-                num_batches,
-                num_rows,
-                num_bytes,
-                file_id: Some(global_input_partition as u64),
-                is_sort_shuffle: true,
-            },
-        ));
-    }
-
-    Ok(results)
+        spill_bytes,
+        repart_time_nanos,
+        spill_time_nanos,
+    })
 }
 
 /// Spills *all* buffered partitions: for each partition, materializes its
@@ -609,95 +619,113 @@ fn spill_all_partitions(
     Ok((batches_written, bytes_written))
 }
 
-/// Finalizes the output by writing the consolidated data file and index file.
+/// Merges every pipeline's per-bucket contribution into **one** task-level
+/// file at `.../{stage}/{task_index}/data.arrow` with a sibling
+/// `.arrow.index` giving byte offsets for each of the K output buckets.
 ///
-/// Returns (data_path, index_path, partition_stats) where partition_stats is
-/// a vector of (partition_id, num_batches, num_rows, num_bytes) tuples.
+/// For each bucket b in 0..K, walks every pipeline once, appending its
+/// spilled bytes (if any) followed by its buffered batches. Bucket
+/// contents are ordered by pipeline-local index for determinism.
+///
+/// Consumes `pipeline_states` — spill files are cleaned up before return.
+///
+/// Returns K `(handoff_idx=bucket, summary)` pairs. `summary.file_id =
+/// task_index`; downstream reconstructs the file path from this.
 #[allow(clippy::too_many_arguments)]
-fn finalize_output(
+fn finalize_task_output(
     work_dir: &str,
     job_id: &JobId,
     stage_id: usize,
-    input_partition: usize,
-    buffered: &mut BufferedBatches,
-    spill_manager: &mut SpillManager,
+    task_index: usize,
+    pipeline_states: Vec<PipelineDrainState>,
+    num_output_partitions: usize,
     schema: &SchemaRef,
     config: &SortShuffleConfig,
-) -> Result<FinalizeResult> {
-    let num_partitions = buffered.num_partitions();
-    let mut index = ShuffleIndex::new(num_partitions);
-    let mut partition_stats = Vec::with_capacity(num_partitions);
+    metrics_set: &ExecutionPlanMetricsSet,
+) -> Result<Vec<(usize, ShuffleWritePartition)>> {
+    let now = Instant::now();
+    let task_metrics = SortShuffleWriteMetrics::new(task_index, metrics_set);
+    let write_timer = task_metrics.write_time.timer();
 
     let mut output_dir = PathBuf::from(work_dir);
     output_dir.push(job_id.as_str());
     output_dir.push(format!("{stage_id}"));
-    output_dir.push(format!("{input_partition}"));
+    output_dir.push(format!("{task_index}"));
     std::fs::create_dir_all(&output_dir)?;
 
     let data_path = output_dir.join("data.arrow");
     let index_path = output_dir.join("data.arrow.index");
 
-    debug!("Writing consolidated shuffle output to {:?}", data_path);
+    debug!(
+        "Writing consolidated shuffle output for task {} to {:?}",
+        task_index, data_path
+    );
 
     let file = File::create(&data_path)?;
     let mut output = BufWriter::new(file);
-
     let opts =
         IpcWriteOptions::default().try_with_compression(Some(config.compression))?;
 
     // Leading schema-header stream (schema message + EOS, no batches) so the
-    // reader can recover the schema even when the requested partition is empty.
+    // reader can recover the schema even when the requested bucket is empty.
     {
         let mut header =
             StreamWriter::try_new_with_options(&mut output, schema, opts.clone())?;
         header.finish()?;
     }
 
-    let (in_memory_batches, in_memory_indices) = buffered.take();
+    let mut index = ShuffleIndex::new(num_output_partitions);
+    let mut bucket_stats: Vec<(u64, u64, u64)> = vec![(0, 0, 0); num_output_partitions];
 
-    for (partition_id, partition_indices) in in_memory_indices.iter().enumerate() {
-        // Flush before reading the kernel position so the BufWriter buffer
-        // is empty; std::io::copy below also writes directly to the inner
-        // File and would land after any pending buffered bytes otherwise.
+    // Take each pipeline's buffered content once so we can iterate bucket-first.
+    let mut pipeline_states = pipeline_states;
+    let per_pipeline_buffered: Vec<(Vec<RecordBatch>, Vec<Vec<(u32, u32)>>)> =
+        pipeline_states
+            .iter_mut()
+            .map(|p| p.buffered.take())
+            .collect();
+
+    for bucket in 0..num_output_partitions {
+        // Flush before recording the kernel position so the offset lines
+        // up with the actual on-disk start of this bucket's section.
         output.flush()?;
-        let partition_start = output.get_mut().stream_position()? as i64;
-        index.set_offset(partition_id, partition_start);
+        let bucket_start = output.get_mut().stream_position()? as i64;
+        index.set_offset(bucket, bucket_start);
 
-        let (spill_batches, spill_rows, spill_bytes) =
-            spill_manager.partition_stats(partition_id);
-
-        if let Some(spill_path) = spill_manager.spill_path(partition_id) {
-            let mut spill_file = File::open(spill_path)?;
-            std::io::copy(&mut spill_file, output.get_mut())?;
-        }
-
-        let mut mem_batches: u64 = 0;
-        let mut mem_rows: u64 = 0;
-        let mut mem_bytes: u64 = 0;
-        if !partition_indices.is_empty() {
-            let iter = PartitionedBatchIterator::new(
-                &in_memory_batches,
-                partition_indices,
-                config.batch_size,
-            );
-            let mut writer =
-                StreamWriter::try_new_with_options(&mut output, schema, opts.clone())?;
-            for result in iter {
-                let batch = result?;
-                mem_rows += batch.num_rows() as u64;
-                mem_bytes += batch.get_array_memory_size() as u64;
-                mem_batches += 1;
-                writer.write(&batch)?;
+        for (pipeline_idx, state) in pipeline_states.iter_mut().enumerate() {
+            // Spill contents for this bucket, if any.
+            let (spill_batches, spill_rows, spill_bytes) =
+                state.spill_manager.partition_stats(bucket);
+            if let Some(spill_path) = state.spill_manager.spill_path(bucket) {
+                let mut spill_file = File::open(spill_path)?;
+                std::io::copy(&mut spill_file, output.get_mut())?;
             }
-            writer.finish()?;
-        }
+            bucket_stats[bucket].0 += spill_batches;
+            bucket_stats[bucket].1 += spill_rows;
+            bucket_stats[bucket].2 += spill_bytes;
 
-        partition_stats.push((
-            partition_id,
-            spill_batches + mem_batches,
-            spill_rows + mem_rows,
-            spill_bytes + mem_bytes,
-        ));
+            // Buffered contents for this bucket.
+            let (in_memory_batches, in_memory_indices) =
+                &per_pipeline_buffered[pipeline_idx];
+            let bucket_indices = &in_memory_indices[bucket];
+            if !bucket_indices.is_empty() {
+                let iter = PartitionedBatchIterator::new(
+                    in_memory_batches,
+                    bucket_indices,
+                    config.batch_size,
+                );
+                let mut writer =
+                    StreamWriter::try_new_with_options(&mut output, schema, opts.clone())?;
+                for result in iter {
+                    let batch = result?;
+                    bucket_stats[bucket].0 += 1;
+                    bucket_stats[bucket].1 += batch.num_rows() as u64;
+                    bucket_stats[bucket].2 += batch.get_array_memory_size() as u64;
+                    writer.write(&batch)?;
+                }
+                writer.finish()?;
+            }
+        }
     }
 
     output.flush()?;
@@ -706,8 +734,72 @@ fn finalize_output(
     index
         .write_to_file(&index_path)
         .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+    write_timer.done();
 
-    Ok((data_path, index_path, partition_stats))
+    // Roll up per-pipeline stats + clean up spill files. All metric writes
+    // happen here (task-level) rather than per-pipeline in drain, so a
+    // single-pipeline task doesn't double-count into a shared MetricsSet
+    // subset when task_index and the pipeline's local index collide.
+    // Reservations drop with the state.
+    let mut total_input_rows: usize = 0;
+    let mut total_spill_events: usize = 0;
+    let mut total_spill_bytes: u64 = 0;
+    let mut total_repart_nanos: u64 = 0;
+    let mut total_spill_nanos: u64 = 0;
+    for state in &mut pipeline_states {
+        total_input_rows += state.input_rows as usize;
+        total_spill_events += state.spill_events as usize;
+        total_spill_bytes = total_spill_bytes.saturating_add(state.spill_bytes);
+        total_repart_nanos =
+            total_repart_nanos.saturating_add(state.repart_time_nanos);
+        total_spill_nanos = total_spill_nanos.saturating_add(state.spill_time_nanos);
+        state
+            .spill_manager
+            .cleanup()
+            .map_err(|e| DataFusionError::Execution(format!("{e:?}")))?;
+    }
+    let total_output_rows: u64 = bucket_stats.iter().map(|(_, rows, _)| *rows).sum();
+    task_metrics.input_rows.add(total_input_rows);
+    task_metrics.output_rows.add(total_output_rows as usize);
+    task_metrics.spill_count.add(total_spill_events);
+    task_metrics.spill_bytes.add(total_spill_bytes as usize);
+    task_metrics
+        .repart_time
+        .add_duration(std::time::Duration::from_nanos(total_repart_nanos));
+    task_metrics
+        .spill_time
+        .add_duration(std::time::Duration::from_nanos(total_spill_nanos));
+
+    debug!(
+        "Sort shuffle task {} finalized in {} seconds. Output: {:?}, Index: {:?}, \
+         Pipelines: {}, Spill events: {}, Spill bytes: {}",
+        task_index,
+        now.elapsed().as_secs(),
+        data_path,
+        index_path,
+        pipeline_states.len(),
+        total_spill_events,
+        total_spill_bytes
+    );
+
+    let mut results = Vec::with_capacity(num_output_partitions);
+    for (bucket, (num_batches, num_rows, num_bytes)) in
+        bucket_stats.into_iter().enumerate()
+    {
+        results.push((
+            bucket,
+            ShuffleWritePartition {
+                partition_id: bucket as u64,
+                num_batches,
+                num_rows,
+                num_bytes,
+                file_id: Some(task_index as u64),
+                is_sort_shuffle: true,
+            },
+        ));
+    }
+
+    Ok(results)
 }
 
 impl DisplayAs for SortShuffleWriterExec {
