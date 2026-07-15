@@ -1312,7 +1312,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                     task_status: task_status::Status::Running(ballista_core::serde::protobuf::RunningTask {
                         executor_id: executor_id.to_owned()
                     }),
-                    partition_slice: slice.clone(),
+                    global_input_partition_ids: slice.clone(),
                 };
                 stage.task_infos.push(task_info);
 
@@ -1328,7 +1328,7 @@ impl ExecutionGraph for AdaptiveExecutionGraph {
                     stage_attempt_num: stage.stage_attempt_num,
                     task_id,
                     task_attempt,
-                    partition_slice: slice,
+                    global_input_partition_ids: slice,
                     plan: stage.plan.clone(),
                     session_config: self.session_config.clone()
                 })

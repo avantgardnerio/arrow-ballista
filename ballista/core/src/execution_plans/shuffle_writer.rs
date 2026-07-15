@@ -109,10 +109,10 @@ impl GlobalPartitionMap {
 /// - Otherwise recurse into the sole child (Filter/Sort/Projection/… are
 ///   partitioning-preserving passthroughs).
 /// - If we hit a leaf or a fan-in without recognising it, treat it as
-///   passthrough (the caller passes `partition_slice`).
+///   passthrough (the caller passes `global_output_partition_ids`).
 fn walk_child_partition_mapping(
     plan: &Arc<dyn ExecutionPlan>,
-    partition_slice: &[usize],
+    global_output_partition_ids: &[usize],
 ) -> GlobalPartitionMap {
     if plan.downcast_ref::<SortPreservingMergeExec>().is_some() {
         return GlobalPartitionMap::Collapsed;
@@ -124,7 +124,7 @@ fn walk_child_partition_mapping(
             }
             Partitioning::UnknownPartitioning(_) => {
                 // RepartitionExec still exchanges rows and freshly numbers
-                // its K outputs, so partition_slice[local] would be a
+                // its K outputs, so global_output_partition_ids[local] would be a
                 // meaningless mapping. DataFusion's BatchPartitioner also
                 // rejects this scheme (`not_impl_err!`), so reaching this
                 // arm means an upstream invariant has broken — fail loudly.
@@ -137,9 +137,9 @@ fn walk_child_partition_mapping(
     }
     let children = plan.children();
     if children.len() == 1 {
-        return walk_child_partition_mapping(children[0], partition_slice);
+        return walk_child_partition_mapping(children[0], global_output_partition_ids);
     }
-    GlobalPartitionMap::PassThrough(partition_slice.to_vec())
+    GlobalPartitionMap::PassThrough(global_output_partition_ids.to_vec())
 }
 
 /// Default bounded-channel capacity for the async-to-blocking I/O bridge.
@@ -197,15 +197,15 @@ pub struct ShuffleWriterExec {
     task_index: usize,
     /// Global partition ids this task's restricted plan covers, in slice
     /// order. Position `i` in the child plan corresponds to
-    /// `partition_slice[i]` globally.
+    /// `global_output_partition_ids[i]` globally.
     ///
     /// Consumed by the passthrough (`None`) branch when the plan is a straight
     /// pass-through of the slice. The `Hash` branch ignores it — the hash
     /// K-space is its own global identity — and even for `None`, if the child
     /// plan contains a partitioning-resetting operator (SPM → 1 output,
     /// RepartitionExec::Hash → 0..K) the writer detects that at path-build
-    /// time and uses `local` directly instead of `partition_slice[local]`.
-    partition_slice: Vec<usize>,
+    /// time and uses `local` directly instead of `global_output_partition_ids[local]`.
+    global_output_partition_ids: Vec<usize>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
     /// Plan properties
@@ -225,7 +225,7 @@ impl Clone for ShuffleWriterExec {
             work_dir: self.work_dir.clone(),
             shuffle_output_partitioning: self.shuffle_output_partitioning.clone(),
             task_index: self.task_index,
-            partition_slice: self.partition_slice.clone(),
+            global_output_partition_ids: self.global_output_partition_ids.clone(),
             metrics: self.metrics.clone(),
             properties: self.properties.clone(),
             state: self.state.clone(),
@@ -311,7 +311,7 @@ impl ShuffleWriterExec {
         // TODO: kill the default-identity slice. It's a compat crutch for
         // plans decoded straight from proto (before executor stamping) and
         // unit tests that don't set a slice. Once every construction path
-        // calls `with_partition_slice`, drop the default and fold it into
+        // calls `with_global_output_partition_ids`, drop the default and fold it into
         // `try_new`'s signature.
         let child_partition_count =
             plan.properties().output_partitioning().partition_count();
@@ -323,7 +323,7 @@ impl ShuffleWriterExec {
             work_dir,
             shuffle_output_partitioning,
             task_index: 0,
-            partition_slice: default_partition_slice,
+            global_output_partition_ids: default_partition_slice,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
             state: Arc::new(Mutex::new(WriterState {
@@ -347,14 +347,14 @@ impl ShuffleWriterExec {
     }
 
     /// Bind this writer to the task's assigned global partition slice.
-    pub fn with_partition_slice(mut self, partition_slice: Vec<usize>) -> Self {
-        self.partition_slice = partition_slice;
+    pub fn with_global_output_partition_ids(mut self, global_output_partition_ids: Vec<usize>) -> Self {
+        self.global_output_partition_ids = global_output_partition_ids;
         self
     }
 
     /// Global partition slice this writer instance is bound to.
-    pub fn partition_slice(&self) -> &[usize] {
-        &self.partition_slice
+    pub fn global_output_partition_ids(&self) -> &[usize] {
+        &self.global_output_partition_ids
     }
 
     /// Get the Job ID for this query stage
@@ -388,7 +388,7 @@ impl ShuffleWriterExec {
     /// **global** output partition id downstream will address:
     ///
     /// - Passthrough (`None`): computed via `walk_child_partition_mapping`
-    ///   over the child plan — either `partition_slice[local]`, `local` (hash
+    ///   over the child plan — either `global_output_partition_ids[local]`, `local` (hash
     ///   K-space), or `0` (collapsed / SPM).
     /// - Hash: hash bucket space is global; global = local.
     pub fn execute_shuffle_write(
@@ -399,7 +399,7 @@ impl ShuffleWriterExec {
         let write_metrics = ShuffleWriteMetrics::new(task_index, &self.metrics);
         let output_partitioning = self.shuffle_output_partitioning.clone();
         let plan = self.plan.clone();
-        let partition_map = walk_child_partition_mapping(&plan, &self.partition_slice);
+        let partition_map = walk_child_partition_mapping(&plan, &self.global_output_partition_ids);
 
         async move {
             let now = Instant::now();
@@ -708,7 +708,7 @@ impl ExecutionPlan for ShuffleWriterExec {
                     self.shuffle_output_partitioning.clone(),
                 )?
                 .with_task_index(self.task_index)
-                .with_partition_slice(self.partition_slice.clone()),
+                .with_global_output_partition_ids(self.global_output_partition_ids.clone()),
             ))
         } else {
             Err(DataFusionError::Plan(

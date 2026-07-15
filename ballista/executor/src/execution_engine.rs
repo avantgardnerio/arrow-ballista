@@ -59,7 +59,7 @@ pub trait ExecutionEngine: Sync + Send {
         job_id: JobId,
         stage_id: usize,
         task_index: usize,
-        partition_slice: Vec<usize>,
+        global_output_partition_ids: Vec<usize>,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
         config: &SessionConfig,
@@ -116,7 +116,7 @@ impl ExecutionEngine for DefaultExecutionEngine {
         job_id: JobId,
         stage_id: usize,
         task_index: usize,
-        partition_slice: Vec<usize>,
+        global_output_partition_ids: Vec<usize>,
         plan: Arc<dyn ExecutionPlan>,
         work_dir: &str,
         _config: &SessionConfig,
@@ -139,7 +139,7 @@ impl ExecutionEngine for DefaultExecutionEngine {
                     // ballista/scheduler/src/state/task_builder.rs). The plan
                     // arriving here is shrink-restricted to slice.len()
                     // partitions; the writer walks its child plan to attach
-                    // global identity, using `partition_slice` for the
+                    // global identity, using `global_output_partition_ids` for the
                     // pass-through case and detecting plan-level partitioning
                     // resets (SPM, RepartitionExec::Hash) for the rest.
                     Ok(Transformed::no(p))
@@ -158,7 +158,7 @@ impl ExecutionEngine for DefaultExecutionEngine {
                 shuffle_writer.shuffle_output_partitioning().cloned(),
             )?
             .with_task_index(task_index)
-            .with_partition_slice(partition_slice);
+            .with_global_output_partition_ids(global_output_partition_ids);
             Ok(Arc::new(DefaultQueryStageExec::new(
                 ShuffleWriterVariant::Hash(exec),
             )))
@@ -174,7 +174,7 @@ impl ExecutionEngine for DefaultExecutionEngine {
                 sort_shuffle_writer.config().clone(),
             )?
             .with_task_index(task_index)
-            .with_partition_slice(partition_slice);
+            .with_global_output_partition_ids(global_output_partition_ids);
             Ok(Arc::new(DefaultQueryStageExec::new(
                 ShuffleWriterVariant::Sort(exec),
             )))

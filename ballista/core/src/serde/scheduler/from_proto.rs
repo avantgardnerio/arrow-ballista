@@ -383,8 +383,8 @@ pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
     let launch_time = task.launch_time;
     let task_id = task.task_id as usize;
     let session_id = task.session_id;
-    let partition_slice = task
-        .partition_slice
+    let global_output_partition_ids = task
+        .global_output_partition_ids
         .iter()
         .map(|p| *p as usize)
         .collect::<Vec<_>>();
@@ -396,7 +396,7 @@ pub fn get_task_definition<T: 'static + AsLogicalPlan, U: 'static + AsExecutionP
         stage_id,
         stage_attempt_num,
         task_index,
-        partition_slice,
+        global_output_partition_ids,
         plan,
         launch_time,
         session_id,
@@ -466,8 +466,8 @@ pub fn get_task_definition_vec<
                 stage_id,
                 stage_attempt_num,
                 task_index: task_id.task_index as usize,
-                partition_slice: task_id
-                    .partition_slice
+                global_output_partition_ids: task_id
+                    .global_output_partition_ids
                     .iter()
                     .map(|p| *p as usize)
                     .collect(),

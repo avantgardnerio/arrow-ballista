@@ -369,7 +369,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
         let stage_id = task.stage_id;
         let stage_attempt_num = task.stage_attempt_num;
         let task_index = task.task_index;
-        let partition_slice = task.partition_slice;
+        let global_output_partition_ids = task.global_output_partition_ids;
         let plan = task.plan;
 
         let key = TaskKey {
@@ -382,7 +382,7 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> ExecutorServer<T,
             job_id.clone(),
             stage_id,
             task_index,
-            partition_slice,
+            global_output_partition_ids,
             plan,
             &self.executor.work_dir,
             &task.session_config,

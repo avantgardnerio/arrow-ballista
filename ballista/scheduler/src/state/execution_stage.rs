@@ -345,11 +345,11 @@ pub struct TaskInfo {
     /// Current status of the task (Running, Successful, Failed).
     pub task_status: task_status::Status,
     /// Plan input partitions this task is (or was) processing. Mirrors the
-    /// `partition_slice` on `TaskDescription`; needed here so executor-loss
+    /// `global_input_partition_ids` on `TaskDescription`; needed here so executor-loss
     /// and retry paths know which partitions to push back to `pending`,
     /// and per-partition failure bookkeeping can locate entries in
     /// `task_failure_numbers`.
-    pub partition_slice: Vec<usize>,
+    pub global_input_partition_ids: Vec<usize>,
 }
 
 impl UnresolvedStage {
@@ -699,7 +699,7 @@ impl RunningStage {
         let mut covered = vec![false; self.partitions];
         for info in &self.task_infos {
             if matches!(info.task_status, task_status::Status::Successful(_)) {
-                for p in &info.partition_slice {
+                for p in &info.global_input_partition_ids {
                     covered[*p] = true;
                 }
             }
@@ -755,7 +755,7 @@ impl RunningStage {
     ///   because the executor died).
     ///
     /// On success, updates the task's status and adjusts per-partition
-    /// failure counters using the task's `partition_slice`.
+    /// failure counters using the task's `global_input_partition_ids`.
     pub fn update_task_info(&mut self, task_index: usize, status: TaskStatus) -> bool {
         debug!("Updating TaskInfo for task_index {task_index}");
         let task_info = &self.task_infos[task_index];
@@ -780,7 +780,7 @@ impl RunningStage {
             return false;
         }
         let scheduled_time = task_info.scheduled_time;
-        let partition_slice = task_info.partition_slice.clone();
+        let global_input_partition_ids = task_info.global_input_partition_ids.clone();
         let task_status = status.status.unwrap();
         let updated_task_info = TaskInfo {
             task_id,
@@ -793,18 +793,18 @@ impl RunningStage {
                 .unwrap()
                 .as_millis(),
             task_status: task_status.clone(),
-            partition_slice: partition_slice.clone(),
+            global_input_partition_ids: global_input_partition_ids.clone(),
         };
         self.task_infos[task_index] = updated_task_info;
 
         match task_status {
             task_status::Status::Failed(failed_task) if failed_task.retryable => {
-                for p in &partition_slice {
+                for p in &global_input_partition_ids {
                     self.task_failure_numbers[*p] += 1;
                 }
             }
             task_status::Status::Successful(_) => {
-                for p in &partition_slice {
+                for p in &global_input_partition_ids {
                     self.task_failure_numbers[*p] = 0;
                 }
             }
@@ -899,7 +899,7 @@ impl RunningStage {
     /// whether any partition in the task has exhausted its retry budget.
     pub fn task_failure_number(&self, task_index: usize) -> usize {
         self.task_infos[task_index]
-            .partition_slice
+            .global_input_partition_ids
             .iter()
             .map(|p| self.task_failure_numbers[*p])
             .max()
@@ -911,7 +911,7 @@ impl RunningStage {
     /// touch failure counts — those are updated in `update_task_info`.
     pub fn reset_task_info(&mut self, task_index: usize) {
         let task = &mut self.task_infos[task_index];
-        let partitions = task.partition_slice.clone();
+        let partitions = task.global_input_partition_ids.clone();
         task.task_status = task_status::Status::Failed(FailedTask {
             error: "task reset for retry".to_string(),
             retryable: true,
@@ -943,7 +943,7 @@ impl RunningStage {
                     count_to_failures: false,
                     failed_reason: Some(FailedReason::ResultLost(ResultLost {})),
                 });
-                to_reschedule.extend(task.partition_slice.iter().copied());
+                to_reschedule.extend(task.global_input_partition_ids.iter().copied());
                 reset += 1;
             }
         }
@@ -1018,7 +1018,7 @@ impl SuccessfulStage {
         for task in self.task_infos.iter().rev() {
             let needs_reschedule =
                 !matches!(task.task_status, task_status::Status::Successful(_));
-            for &p in &task.partition_slice {
+            for &p in &task.global_input_partition_ids {
                 if p < seen.len() && !seen[p] {
                     seen[p] = true;
                     if needs_reschedule {
@@ -1338,7 +1338,7 @@ mod tests {
             task_status: task_status::Status::Running(RunningTask {
                 executor_id: executor.to_string(),
             }),
-            partition_slice: partitions,
+            global_input_partition_ids: partitions,
         });
     }
 

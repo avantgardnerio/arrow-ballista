@@ -908,7 +908,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                                             // failure counters are the durable identity.
                                             let over_limit: Vec<usize> = running_stage
                                                 .task_infos[task_index]
-                                                .partition_slice
+                                                .global_input_partition_ids
                                                 .iter()
                                                 .copied()
                                                 .filter(|p| {
@@ -1543,7 +1543,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                     task_status: task_status::Status::Running(RunningTask {
                         executor_id: executor_id.to_owned()
                     }),
-                    partition_slice: slice.clone(),
+                    global_input_partition_ids: slice.clone(),
                 };
                 stage.task_infos.push(task_info);
 
@@ -1559,7 +1559,7 @@ impl ExecutionGraph for StaticExecutionGraph {
                     stage_attempt_num: stage.stage_attempt_num,
                     task_id,
                     task_attempt,
-                    partition_slice: slice,
+                    global_input_partition_ids: slice,
                     plan: stage.plan.clone(),
                     session_config: self.session_config.clone()
                 })
@@ -1603,7 +1603,7 @@ impl Debug for StaticExecutionGraph {
 }
 
 /// Creates a new `TaskInfo` for a task that is about to be scheduled on an
-/// executor. The caller sets `partition_slice` to the partitions this task
+/// executor. The caller sets `global_input_partition_ids` to the partitions this task
 /// will process (bind loops draw the slice from `stage.pending`).
 pub fn create_task_info(executor_id: String, task_id: usize) -> TaskInfo {
     TaskInfo {
@@ -1617,7 +1617,7 @@ pub fn create_task_info(executor_id: String, task_id: usize) -> TaskInfo {
         end_exec_time: 0,
         finish_time: 0,
         task_status: task_status::Status::Running(RunningTask { executor_id }),
-        partition_slice: vec![],
+        global_input_partition_ids: vec![],
     }
 }
 
@@ -1733,7 +1733,7 @@ impl ExecutionPlanVisitor for ExecutionStageBuilder {
 
 /// Represents the basic unit of work for the Ballista executor.
 ///
-/// One `TaskDescription` drives all of `partition_slice`'s partitions
+/// One `TaskDescription` drives all of `global_input_partition_ids`'s partitions
 /// through one plan-Arc on the assigned executor.
 #[derive(Clone)]
 pub struct TaskDescription {
@@ -1751,7 +1751,7 @@ pub struct TaskDescription {
     /// Populated at bind time from the stage's `PendingPartitions` cursor
     /// sized to the assigned executor's free vcores. Baked into `plan`
     /// via `task_builder::restrict_plan_to_partitions` before dispatch.
-    pub partition_slice: Vec<usize>,
+    pub global_input_partition_ids: Vec<usize>,
     /// The physical execution plan to run for this task.
     pub plan: Arc<dyn ExecutionPlan>,
     /// Session configuration for this task's execution context.
@@ -2212,11 +2212,11 @@ mod test {
         //
         // Under the append-only task_infos model, each retry gets a fresh
         // task_index (rather than reusing the original task's slot). The
-        // partition_slice is what stably identifies "which task is being
+        // global_input_partition_ids is what stably identifies "which task is being
         // retried" — assert on that instead of task_index.
         for attempt in 1..5 {
             if let Some(task2_attempt) = agg_graph.pop_next_task(&executor.id)? {
-                assert_eq!(task2_attempt.partition_slice, task2.partition_slice);
+                assert_eq!(task2_attempt.global_input_partition_ids, task2.global_input_partition_ids);
                 assert_eq!(task2_attempt.task_attempt, attempt);
                 last_attempt = task2_attempt.task_attempt;
                 let task_status = mock_failed_task(

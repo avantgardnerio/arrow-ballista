@@ -68,7 +68,7 @@ pub fn restrict_plan_to_partitions(
 /// assigned `partitions` remain. `output_partitioning().partition_count()`
 /// shrinks to `partitions.len()` — matching what `restrict_shuffle_reader`
 /// already does — so position `i` in the restricted plan corresponds to the
-/// task's `partition_slice[i]` globally.
+/// task's `global_input_partition_ids[i]` globally.
 fn restrict_scan(
     plan: &Arc<dyn ExecutionPlan>,
     partitions: &[usize],

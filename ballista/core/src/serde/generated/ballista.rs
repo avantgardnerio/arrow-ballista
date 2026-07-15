@@ -426,7 +426,7 @@ pub struct PartitionId {
 }
 /// Within-stage task identity (paired with job_id + stage_id on the parent
 /// MultiTaskDefinition). One task processes a slice of partitions, so
-/// `task_index` names the task within the stage; `partition_slice` gives
+/// `task_index` names the task within the stage; `global_output_partition_ids` gives
 /// the concrete global partition ids the task's restricted plan is
 /// covering. Writers use these to name shuffle files with global identity
 /// (via `create_shuffle_path`) so downstream reads have a stable, canonical
@@ -440,9 +440,9 @@ pub struct TaskId {
     #[prost(uint32, tag = "3")]
     pub task_index: u32,
     /// Global partition ids covered by this task, in slice order. Position i in
-    /// the restricted plan corresponds to `partition_slice\[i\]` globally.
+    /// the restricted plan corresponds to `global_output_partition_ids\[i\]` globally.
     #[prost(uint32, repeated, tag = "4")]
-    pub partition_slice: ::prost::alloc::vec::Vec<u32>,
+    pub global_output_partition_ids: ::prost::alloc::vec::Vec<u32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PartitionStats {
@@ -851,9 +851,9 @@ pub struct PollWorkParams {
 }
 /// Pull-based single-task dispatch. One task processes a slice of
 /// partitions; `task_index` names the task within the stage,
-/// `partition_slice` gives the concrete global partition ids it covers. The
+/// `global_output_partition_ids` gives the concrete global partition ids it covers. The
 /// task's plan is scheduler-side shrink-restricted so its leaves report
-/// `slice.len()` partitions; the writer uses `partition_slice` to attach
+/// `slice.len()` partitions; the writer uses `global_output_partition_ids` to attach
 /// global identity to shuffle files (except in cases where the plan itself
 /// resets partitioning: the writer walks its child plan to detect
 /// SortPreservingMergeExec or RepartitionExec::Hash and picks the right
@@ -882,7 +882,7 @@ pub struct TaskDefinition {
     pub props: ::prost::alloc::vec::Vec<KeyValuePair>,
     /// Global partition ids covered by this task, in slice order.
     #[prost(uint32, repeated, tag = "12")]
-    pub partition_slice: ::prost::alloc::vec::Vec<u32>,
+    pub global_output_partition_ids: ::prost::alloc::vec::Vec<u32>,
 }
 /// A set of tasks in the same stage
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -95,8 +95,8 @@ impl Debug for WriterState {
 /// input file this task drained).
 ///
 /// Output partition ids in summaries are the K-space hash buckets, which are
-/// inherently global — no plan-walk needed. `partition_slice` is used only
-/// as the file-naming disambiguator: `file_id = partition_slice[local_input]`
+/// inherently global — no plan-walk needed. `global_output_partition_ids` is used only
+/// as the file-naming disambiguator: `file_id = global_output_partition_ids[local_input]`
 /// gives each file a global input partition id, and since slices are disjoint
 /// across the stage's tasks, files never collide across tasks.
 #[derive(Debug)]
@@ -118,10 +118,10 @@ pub struct SortShuffleWriterExec {
     task_index: usize,
     /// Global input partition ids this task's restricted plan covers, in
     /// slice order. Position `i` in the child plan maps to
-    /// `partition_slice[i]` globally — used as `file_id` in shuffle paths and
+    /// `global_output_partition_ids[i]` globally — used as `file_id` in shuffle paths and
     /// reported summaries so files across tasks in the same stage don't
     /// collide (slices are disjoint).
-    partition_slice: Vec<usize>,
+    global_output_partition_ids: Vec<usize>,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
     /// Plan properties
@@ -142,7 +142,7 @@ impl Clone for SortShuffleWriterExec {
             shuffle_output_partitioning: self.shuffle_output_partitioning.clone(),
             config: self.config.clone(),
             task_index: self.task_index,
-            partition_slice: self.partition_slice.clone(),
+            global_output_partition_ids: self.global_output_partition_ids.clone(),
             metrics: self.metrics.clone(),
             properties: self.properties.clone(),
             state: self.state.clone(),
@@ -226,7 +226,7 @@ impl SortShuffleWriterExec {
             shuffle_output_partitioning,
             config,
             task_index: 0,
-            partition_slice: default_partition_slice,
+            global_output_partition_ids: default_partition_slice,
             metrics: ExecutionPlanMetricsSet::new(),
             properties,
             state: Arc::new(Mutex::new(WriterState {
@@ -248,17 +248,17 @@ impl SortShuffleWriterExec {
     }
 
     /// Bind this writer to the task's assigned global input-partition slice.
-    /// `partition_slice[i]` gives the global id of the child plan's local
+    /// `global_output_partition_ids[i]` gives the global id of the child plan's local
     /// input partition `i`; the sort writer uses this to name each per-input
     /// output file so different tasks in the stage don't collide.
-    pub fn with_partition_slice(mut self, partition_slice: Vec<usize>) -> Self {
-        self.partition_slice = partition_slice;
+    pub fn with_global_output_partition_ids(mut self, global_output_partition_ids: Vec<usize>) -> Self {
+        self.global_output_partition_ids = global_output_partition_ids;
         self
     }
 
     /// Global input-partition slice this writer instance is bound to.
-    pub fn partition_slice(&self) -> &[usize] {
-        &self.partition_slice
+    pub fn global_output_partition_ids(&self) -> &[usize] {
+        &self.global_output_partition_ids
     }
 
     /// Get the Job ID for this query stage
@@ -294,7 +294,7 @@ impl SortShuffleWriterExec {
     /// One pipeline per input partition of the (scheduler-side-shrink-restricted)
     /// child plan runs concurrently. Each drains one input partition into its
     /// own file at `.../{stage}/{global_input_partition}/data.arrow` +
-    /// `.index`, where `global_input_partition = partition_slice[local]`.
+    /// `.index`, where `global_input_partition = global_output_partition_ids[local]`.
     /// Because slices are disjoint across the stage's tasks, no cross-task
     /// path collisions can happen. Per-pipeline memory budget is
     /// `memory_limit_per_task_bytes / num_input_partitions` so peak memory
@@ -314,7 +314,7 @@ impl SortShuffleWriterExec {
         let job_id = self.job_id.clone();
         let stage_id = self.stage_id;
         let partitioning = self.shuffle_output_partitioning.clone();
-        let partition_slice = self.partition_slice.clone();
+        let global_output_partition_ids = self.global_output_partition_ids.clone();
         let metrics_set = self.metrics.clone();
 
         async move {
@@ -327,11 +327,11 @@ impl SortShuffleWriterExec {
             let num_input_partitions =
                 plan.properties().output_partitioning().partition_count();
 
-            if num_input_partitions != partition_slice.len() {
+            if num_input_partitions != global_output_partition_ids.len() {
                 return Err(DataFusionError::Internal(format!(
                     "SortShuffleWriterExec plan reports {num_input_partitions} \
-                     partitions but partition_slice has {}",
-                    partition_slice.len()
+                     partitions but global_output_partition_ids has {}",
+                    global_output_partition_ids.len()
                 )));
             }
 
@@ -348,7 +348,7 @@ impl SortShuffleWriterExec {
 
             let mut handles = Vec::with_capacity(num_input_partitions);
             for (local_input_partition, &global_input_partition) in
-                partition_slice.iter().enumerate()
+                global_output_partition_ids.iter().enumerate()
             {
                 let plan = plan.clone();
                 let ctx = context.clone();
@@ -769,7 +769,7 @@ impl ExecutionPlan for SortShuffleWriterExec {
                     self.config.clone(),
                 )?
                 .with_task_index(self.task_index)
-                .with_partition_slice(self.partition_slice.clone()),
+                .with_global_output_partition_ids(self.global_output_partition_ids.clone()),
             ))
         } else {
             Err(DataFusionError::Plan(

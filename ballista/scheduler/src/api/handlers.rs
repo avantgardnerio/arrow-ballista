@@ -1011,7 +1011,7 @@ mod tests {
             end_exec_time: end,
             finish_time: 0,
             task_status: task_status::Status::Running(Default::default()),
-            partition_slice: vec![],
+            global_input_partition_ids: vec![],
         }
     }
 

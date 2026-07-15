@@ -426,7 +426,7 @@ fn bind_one(
         .max()
         .unwrap_or(0);
     let mut task_info = create_task_info(executor_id.clone(), task_id);
-    task_info.partition_slice = slice.clone();
+    task_info.global_input_partition_ids = slice.clone();
     running_stage.task_infos.push(task_info);
     let key = TaskKey {
         job_id: job_id.clone(),
@@ -439,7 +439,7 @@ fn bind_one(
         stage_attempt_num: running_stage.stage_attempt_num,
         task_id,
         task_attempt,
-        partition_slice: slice,
+        global_input_partition_ids: slice,
         plan: running_stage.plan.clone(),
         session_config: running_stage.session_config.clone(),
     };
@@ -734,7 +734,7 @@ mod test {
     /// Sum partitions covered per (job, executor). Under multi-partition
     /// tasks one task covers a slice of partitions rather than exactly one,
     /// so counting bound tasks would understate the distribution. Summing
-    /// `partition_slice.len()` preserves the "N partitions distributed as
+    /// `global_input_partition_ids.len()` preserves the "N partitions distributed as
     /// X/Y/Z across executors" invariant the assertions actually care about.
     fn get_result(bound_tasks: Vec<BoundTask>) -> HashMap<JobId, HashMap<String, usize>> {
         let mut result = HashMap::new();
@@ -744,7 +744,7 @@ mod test {
                 .entry(bound_task.1.key.job_id)
                 .or_insert_with(HashMap::new);
             let n = entry.entry(bound_task.0).or_insert_with(|| 0);
-            *n += bound_task.1.partition_slice.len();
+            *n += bound_task.1.global_input_partition_ids.len();
         }
 
         result
@@ -756,7 +756,7 @@ mod test {
     fn total_partitions_covered(bound_tasks: &[BoundTask]) -> usize {
         bound_tasks
             .iter()
-            .map(|(_, task)| task.partition_slice.len())
+            .map(|(_, task)| task.global_input_partition_ids.len())
             .sum()
     }
 

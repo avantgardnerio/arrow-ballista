@@ -700,8 +700,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
         let stage_id = task.key.stage_id;
 
         if self.active_job_cache.get(&job_id).is_some() {
-            let restricted =
-                restrict_plan_to_partitions(task.plan.clone(), &task.partition_slice)?;
+            let restricted = restrict_plan_to_partitions(
+                task.plan.clone(),
+                &task.global_input_partition_ids,
+            )?;
             let mut plan_buf: Vec<u8> = vec![];
             let plan_proto = PhysicalPlanNode::try_from_physical_plan(
                 restricted,
@@ -723,7 +725,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                     .unwrap()
                     .as_millis() as u64,
                 props: task.session_config.to_key_value_pairs(),
-                partition_slice: task.partition_slice.iter().map(|p| *p as u32).collect(),
+                // output ids _are_ input ids in passthrough partitioning
+                // mode. All other modes (hash, single) will ignore this
+                // field.
+                global_output_partition_ids: task
+                    .global_input_partition_ids
+                    .iter()
+                    .map(|p| *p as u32)
+                    .collect(),
             };
             Ok(task_definition)
         } else {
@@ -798,8 +807,10 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
 
         let mut multi_tasks = Vec::with_capacity(tasks.len());
         for task in tasks {
-            let restricted =
-                restrict_plan_to_partitions(task.plan.clone(), &task.partition_slice)?;
+            let restricted = restrict_plan_to_partitions(
+                task.plan.clone(),
+                &task.global_input_partition_ids,
+            )?;
             let mut plan_buf: Vec<u8> = vec![];
             let plan_proto = PhysicalPlanNode::try_from_physical_plan(restricted, codec)?;
             plan_proto.try_encode(&mut plan_buf)?;
@@ -808,7 +819,14 @@ impl<T: 'static + AsLogicalPlan, U: 'static + AsExecutionPlan> TaskManager<T, U>
                 task_id: task.task_id as u32,
                 task_attempt_num: task.task_attempt as u32,
                 task_index: task.key.task_index as u32,
-                partition_slice: task.partition_slice.iter().map(|p| *p as u32).collect(),
+                // output ids _are_ input ids in passthrough partitioning
+                // mode. All other modes (hash, single) will ignore this
+                // field.
+                global_output_partition_ids: task
+                    .global_input_partition_ids
+                    .iter()
+                    .map(|p| *p as u32)
+                    .collect(),
             }];
             multi_tasks.push(MultiTaskDefinition {
                 task_ids,
