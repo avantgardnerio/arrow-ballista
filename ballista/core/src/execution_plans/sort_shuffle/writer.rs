@@ -44,7 +44,7 @@ use tokio::sync::oneshot;
 
 use super::super::shuffle_writer::{result_schema, summaries_to_batch};
 use super::super::shuffle_writer_trait::ShuffleWriter;
-use super::buffer::BufferedBatches;
+use super::buffer::{BufferedBatches, BufferedTake};
 use super::config::SortShuffleConfig;
 use super::index::ShuffleIndex;
 use super::partitioned_batch_iterator::PartitionedBatchIterator;
@@ -311,7 +311,7 @@ impl SortShuffleWriterExec {
     /// restricted) child plan runs concurrently. Each pipeline drains one
     /// input partition into per-bucket in-memory buffers and per-pipeline
     /// spill files, then returns its accumulated state. After every
-    /// pipeline finishes, [`finalize_task_output`] concatenates their
+    /// pipeline finishes, `finalize_task_output` concatenates their
     /// per-bucket contributions into **one** task-level file at
     /// `.../{stage}/{task_index}/data.arrow` (+`.index`) — bucket b's
     /// section is the sequential union of every pipeline's bucket-b
@@ -682,11 +682,10 @@ fn finalize_task_output(
 
     // Take each pipeline's buffered content once so we can iterate bucket-first.
     let mut pipeline_states = pipeline_states;
-    let per_pipeline_buffered: Vec<(Vec<RecordBatch>, Vec<Vec<(u32, u32)>>)> =
-        pipeline_states
-            .iter_mut()
-            .map(|p| p.buffered.take())
-            .collect();
+    let per_pipeline_buffered: Vec<BufferedTake> = pipeline_states
+        .iter_mut()
+        .map(|p| p.buffered.take())
+        .collect();
 
     for bucket in 0..num_output_partitions {
         // Flush before recording the kernel position so the offset lines
