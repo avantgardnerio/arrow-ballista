@@ -87,6 +87,44 @@ At SF100 there are ~20M distinct `l_partkey` values and ~5 `l_suppkey`
 values per `l_partkey` — routing on `l_partkey` alone gives plenty of
 distribution headroom for K=16 partitions.
 
+## Required config: `max_partitions_per_task != 1`
+
+`SortShuffleWriter` today writes **one file per task, indexed by output
+partition** — with N tasks and K output partitions per shuffle stage,
+that's `N` files total. `ShuffleWriterExec` (Passthrough) writes **one
+file per output partition per task** — `N × K` files total. Under
+Ballista's default `ballista.scheduler.max_partitions_per_task=1`, one
+task is emitted per input partition, so `N` equals `target_partitions`
+— and `N × K` explodes.
+
+Concrete for Q20's `Hash([l_partkey, l_suppkey], 16)` exchange:
+
+| Regime | Tasks / stage | K URRE outputs / task | Files / stage |
+|---|---:|---:|---:|
+| SortShuffle (today, index-based) | `target_partitions` | — | `target_partitions` |
+| URRE + Passthrough, `max_partitions_per_task=1` (default) | `target_partitions` | `target_partitions` | `target_partitions²` |
+| URRE + Passthrough, `max_partitions_per_task=vcores` or `=0` (fills vcores) | `target_partitions / vcores` | `target_partitions` | `target_partitions² / vcores` |
+
+Doc benchmarking config (`docs/source/contributors-guide/benchmarking.md`)
+is `target_partitions=256`, `concurrent_tasks=8` per exec, and does *not*
+raise `max_partitions_per_task`. So under the current defaults, URRE +
+Passthrough would produce 65,536 files per shuffle stage vs.
+SortShuffle's 256.
+
+**The demo must set `max_partitions_per_task=0` (or `=vcores`).** Under
+that setting doc-cluster numbers become 32 tasks × 256 URRE = 8,192
+files per stage. Larger than SortShuffle's 256, but each stage-N+1 task
+reads only its own bucket + a small halo from each producer — a fixed
+~64 files per downstream task, not all 8,192.
+
+Local dev-loop numbers (2 execs × 4 vcores, `target_partitions=16`):
+
+| Regime | Tasks | Files / stage |
+|---|---:|---:|
+| SortShuffle | 16 | 16 |
+| URRE + Passthrough, `max_partitions_per_task=1` | 16 | 256 |
+| URRE + Passthrough, `max_partitions_per_task=0` | 4 | 64 |
+
 ## Half-open interval convention
 
 Mirror `UnorderedRangeRepartitionExec`'s convention: partition k owns
@@ -99,6 +137,11 @@ task k:
 - k=K-1:    `l_partkey >= cut[K-2]`
 
 ## What "green" looks like
+
+Run config (in addition to the current baseline flags):
+`ballista.optimizer.adaptive_range_shuffle.enabled=true` **and**
+`ballista.scheduler.max_partitions_per_task=0` (see "Required config"
+above).
 
 A single-iteration run of Q20 SF100 with slice-1 applied should show:
 
