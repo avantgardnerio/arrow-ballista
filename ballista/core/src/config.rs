@@ -117,6 +117,14 @@ pub const BALLISTA_BROADCAST_JOIN_THRESHOLD_ROWS: &str =
 pub const BALLISTA_HASH_JOIN_MAX_BUILD_PARTITION_BYTES: &str =
     "ballista.optimizer.hash_join_max_build_partition_bytes";
 
+/// Configuration key for the adaptive-range-shuffle rewrite (POC).
+/// Rewrites `Partial → Hash → FinalPartitioned` into a post-shuffle
+/// range-filter shape backed by `UnorderedRangeRepartitionExec` + Passthrough
+/// writer. Default `false` — opt-in for demos while the rewrite is under
+/// development. See `dev-notes/adaptive-range-shuffle/lineitem-agg.md`.
+pub const BALLISTA_ADAPTIVE_RANGE_SHUFFLE_ENABLED: &str =
+    "ballista.optimizer.adaptive_range_shuffle.enabled";
+
 /// Configuration key to enable AQE coalesce-shuffle-partitions rule.
 /// Disabled by default — opt in when the workload benefits from larger
 /// downstream tasks more than from preserved parallelism.
@@ -274,6 +282,13 @@ static CONFIG_ENTRIES: LazyLock<HashMap<String, ConfigEntry>> = LazyLock::new(||
                          which makes AQE use a hash join regardless of build size.".to_string(),
                          DataType::UInt64,
                          Some((64 * 1024 * 1024).to_string())),
+        ConfigEntry::new(BALLISTA_ADAPTIVE_RANGE_SHUFFLE_ENABLED.to_string(),
+                         "Enable the adaptive-range-shuffle rewrite (POC). \
+                         Detects `Partial → Hash → FinalPartitioned` and rewrites the \
+                         Hash exchange into an URRE-based post-shuffle range-filter \
+                         pattern. Default false while under development.".to_string(),
+                         DataType::Boolean,
+                         Some(false.to_string())),
         ConfigEntry::new(BALLISTA_CLIENT_PULL.to_string(),
                          "Should client employ pull or push job tracking. In pull mode client will make a request to server in the loop, until job finishes. Pull mode is kept for legacy clients.".to_string(),
                          DataType::Boolean,
@@ -630,6 +645,11 @@ impl BallistaConfig {
     /// Is Adaptive Query Planner enabled
     pub fn adaptive_query_planner_enabled(&self) -> bool {
         self.get_bool_setting(BALLISTA_ADAPTIVE_PLANNER_ENABLED)
+    }
+
+    /// Is the adaptive-range-shuffle rewrite (POC) enabled
+    pub fn adaptive_range_shuffle_enabled(&self) -> bool {
+        self.get_bool_setting(BALLISTA_ADAPTIVE_RANGE_SHUFFLE_ENABLED)
     }
 
     /// Returns the target batch size for sort-based shuffle.

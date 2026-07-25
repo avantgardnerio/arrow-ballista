@@ -19,8 +19,8 @@ use crate::state::aqe::adapter::BallistaAdapter;
 use crate::state::aqe::execution_plan::{AdaptiveDatafusionExec, ExchangeExec};
 use crate::state::aqe::optimizer_rule::chaos_exec::ChaosCreatingRule;
 use crate::state::aqe::optimizer_rule::{
-    CoalescePartitionsRule, DelayJoinSelectionRule, DistributedExchangeRule,
-    PropagateEmptyExecRule, SelectJoinRule,
+    AdaptiveRangeShuffleRule, CoalescePartitionsRule, DelayJoinSelectionRule,
+    DistributedExchangeRule, PropagateEmptyExecRule, SelectJoinRule,
 };
 use crate::state::distributed_explain::handle_explain_plan;
 use crate::state::execution_stage::StageOutput;
@@ -507,6 +507,14 @@ impl AdaptivePlanner {
         // );
         //
         physical_optimizers.extend(Self::datafusion_optimizers());
+
+        // Detect (and later rewrite) `Partial → Hash → FinalPartitioned` into
+        // the adaptive-range-shuffle shape. Runs after DF's own optimizers
+        // have finalized aggregate mode + exchange partitioning, before the
+        // final distribution splitter (`DistributedExchangeRule`) turns the
+        // plan into per-stage subtrees. Gated by
+        // `ballista.optimizer.adaptive_range_shuffle.enabled` (default false).
+        physical_optimizers.push(Arc::new(AdaptiveRangeShuffleRule));
 
         // `DistributedExchangeRule` should be the last plan mutator rule in the chain
         physical_optimizers
